@@ -18,7 +18,8 @@ from gumbel_az.execution.base import ExecutionResult
 from gumbel_az.execution.heartbeat import HeartbeatRegistry
 from gumbel_az.execution.messages import WorkerCapabilities
 from gumbel_az.execution.task_lease import TaskLeaseManager
-from gumbel_az.logging import JsonlWriter
+from gumbel_az.logging import JsonlWriter, MetricWriter
+from gumbel_az.orchestration.run import RunOrchestrator
 from gumbel_az.runtime import detect_runtime_backend
 from gumbel_az.storage import create_run_directory
 from gumbel_az.storage.atomic import atomic_write_json
@@ -249,7 +250,7 @@ def make_ray_worker_actor():
 
 
 class LanRayExecutionBackend:
-    """Initialize LAN Ray run state and verify optional Ray availability."""
+    """Run the training lifecycle after connecting to a Ray LAN cluster."""
 
     name = "lan_ray"
 
@@ -262,16 +263,37 @@ class LanRayExecutionBackend:
         paths = create_run_directory(config)
         save_resolved_config(config, paths.run_dir)
         event_writer = JsonlWriter(paths.events_path)
+        metric_writer = MetricWriter(paths.metrics_path)
         if not ray.is_initialized():
             address = config.cluster.head_address or "auto"
             ray.init(address=address, ignore_reinit_error=True)
+        runtime_backend = detect_runtime_backend()
         state = {
             "run_id": paths.run_id,
             "backend": self.name,
-            "status": "initialized",
+            "status": "initializing",
             "cluster_head_address": config.cluster.head_address,
             "config_path": str(paths.resolved_config_path),
         }
         atomic_write_json(paths.run_state_path, state)
         event_writer.write({"event": "lan_ray_initialized", **state})
-        return ExecutionResult(paths.run_id, paths.run_dir, "initialized")
+        metric_writer.write_metrics(0, {"lan_ray_initialized": True})
+        event_writer.write(
+            {
+                "event": "lan_ray_head_training_started",
+                "run_id": paths.run_id,
+                "cluster_head_address": config.cluster.head_address,
+                "runtime_backend": runtime_backend.name,
+                "note": (
+                    "Ray cluster connection is active; training lifecycle is running "
+                    "on the head node."
+                ),
+            }
+        )
+        return RunOrchestrator(
+            config,
+            paths=paths,
+            runtime_backend=runtime_backend,
+            event_writer=event_writer,
+            metric_writer=metric_writer,
+        ).run()

@@ -7,9 +7,12 @@ from pathlib import Path
 import jax.numpy as jnp
 import pytest
 
+import gumbel_az.execution.lan_ray as lan_ray_module
+from gumbel_az.config import load_config
 from gumbel_az.execution.heartbeat import HeartbeatRegistry
 from gumbel_az.execution.lan_ray import (
     HeadController,
+    LanRayExecutionBackend,
     WorkerActorCore,
     make_ray_head_actor,
     make_ray_worker_actor,
@@ -18,6 +21,22 @@ from gumbel_az.execution.messages import WorkerCapabilities, utc_now
 from gumbel_az.execution.task_lease import TaskLeaseManager
 from gumbel_az.replay import ReplayWriter
 from gumbel_az.replay.codec import encode_samples
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEBUG_CONFIG = PROJECT_ROOT / "configs" / "connect_four_cpu_debug.yaml"
+
+
+class _FakeRay:
+    def __init__(self) -> None:
+        self.init_calls: list[dict] = []
+        self._initialized = False
+
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+    def init(self, **kwargs) -> None:
+        self.init_calls.append(kwargs)
+        self._initialized = True
 
 
 def _capabilities(worker_id: str = "worker-1") -> WorkerCapabilities:
@@ -221,3 +240,48 @@ def test_ray_actor_factories_keep_ray_optional() -> None:
         assert make_ray_worker_actor() is not None
     except RuntimeError as exc:
         assert "Ray is not installed" in str(exc) or "Ray could not be imported" in str(exc)
+
+
+def test_lan_ray_backend_runs_training_after_cluster_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_ray = _FakeRay()
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().run(config)
+
+    assert result.status == "completed"
+    assert fake_ray.init_calls == [
+        {"address": "127.0.0.1:6399", "ignore_reinit_error": True}
+    ]
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert state["backend"] == "lan_ray"
+    assert state["status"] == "completed"
+    assert state["train_step"] == 1
+    assert state["games_seen"] == 1
+    assert (result.run_dir / "replay" / "index.json").exists()
+    assert (result.run_dir / "checkpoints" / "latest.json").exists()
+    assert (result.run_dir / "eval" / "matches.jsonl").exists()
+    events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    assert '"event": "lan_ray_initialized"' in events
+    assert '"event": "lan_ray_head_training_started"' in events
+    assert '"event": "training_completed"' in events
