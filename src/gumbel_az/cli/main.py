@@ -685,6 +685,11 @@ def cluster_head(
     platform_warning = _ray_cluster_platform_warning()
     if platform_warning is not None:
         typer.echo(platform_warning)
+    typer.echo(f"ray head address for workers: {node_ip}:{port}")
+    typer.echo(
+        "worker command: "
+        f"gaz cluster worker --head {node_ip}:{port} --config {config} --auto"
+    )
     try:
         import ray  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:

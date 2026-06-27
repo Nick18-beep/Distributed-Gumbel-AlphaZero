@@ -374,6 +374,11 @@ def test_cluster_head_wait_workers_uses_resolved_lan_address(
     )
 
     assert result.exit_code == 0
+    assert "ray head address for workers: 192.168.1.12:6380" in result.output
+    assert (
+        "worker command: gaz cluster worker --head 192.168.1.12:6380"
+        in result.output
+    )
     assert calls[0]["command"] == [
         "ray",
         "start",
