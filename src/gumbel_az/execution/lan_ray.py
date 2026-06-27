@@ -37,6 +37,11 @@ def _require_ray():
     return ray
 
 
+def _enable_ray_experimental_multinode_if_needed() -> None:
+    if sys.platform in {"win32", "darwin"}:
+        os.environ.setdefault("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", "1")
+
+
 def detect_worker_capabilities(worker_id: str | None = None) -> WorkerCapabilities:
     runtime = detect_runtime_backend()
     devices: tuple[str, ...] = ()
@@ -259,6 +264,7 @@ class LanRayExecutionBackend:
             raise ValueError(
                 f"LanRayExecutionBackend cannot run backend {config.execution.backend!r}"
             )
+        _enable_ray_experimental_multinode_if_needed()
         ray = _require_ray()
         paths = create_run_directory(config)
         save_resolved_config(config, paths.run_dir)

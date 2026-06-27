@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -181,6 +182,55 @@ def test_cluster_head_resolves_wildcard_bind_host_to_node_ip(
     assert cli_main._ray_node_ip("0.0.0.0") == "192.168.1.10"
     assert cli_main._ray_node_ip("::") == "192.168.1.10"
     assert cli_main._ray_node_ip("192.168.1.20") == "192.168.1.20"
+
+
+def test_ray_cluster_env_enables_experimental_non_linux_multinode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", raising=False)
+    monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+
+    env = cli_main._ray_cluster_env()
+
+    assert env["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
+
+
+def test_cluster_worker_passes_non_linux_ray_multinode_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ray":
+            return object()
+        return real_import(name, globals, locals, fromlist, level)
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "worker",
+            "--head",
+            "192.168.1.12:6379",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "connect_four_lan.yaml"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Ray multi-node on macOS is experimental" in result.output
+    assert calls[0]["command"] == ["ray", "start", "--address=192.168.1.12:6379"]
+    assert calls[0]["env"]["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
 
 
 def test_config_command_accepts_override() -> None:

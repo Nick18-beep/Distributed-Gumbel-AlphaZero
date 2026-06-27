@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -121,6 +122,27 @@ def _ray_node_ip(host: str) -> str:
     if host in {"", "0.0.0.0", "::"}:
         return _detect_lan_ip()
     return host
+
+
+def _ray_cluster_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if sys.platform in {"win32", "darwin"}:
+        env.setdefault("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", "1")
+    return env
+
+
+def _ray_cluster_platform_warning() -> str | None:
+    if sys.platform == "win32":
+        return (
+            "Ray multi-node on Windows is experimental; "
+            "RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1 was set for this command."
+        )
+    if sys.platform == "darwin":
+        return (
+            "Ray multi-node on macOS is experimental; "
+            "RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1 was set for this command."
+        )
+    return None
 
 
 def _prompt_int(label: str) -> int | None:
@@ -542,6 +564,10 @@ def cluster_head(
     """Start a Ray head node."""
     _validate_config(config, overrides)
     node_ip = _ray_node_ip(host)
+    ray_env = _ray_cluster_env()
+    platform_warning = _ray_cluster_platform_warning()
+    if platform_warning is not None:
+        typer.echo(platform_warning)
     try:
         import ray  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
@@ -564,6 +590,7 @@ def cluster_head(
                 "--disable-usage-stats",
             ],
             check=True,
+            env=ray_env,
         )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         typer.echo(f"Cannot start Ray head: {exc}", err=True)
@@ -582,6 +609,10 @@ def cluster_worker(
 ) -> None:
     """Connect a worker to a Ray head."""
     _validate_config(config, overrides)
+    ray_env = _ray_cluster_env()
+    platform_warning = _ray_cluster_platform_warning()
+    if platform_warning is not None:
+        typer.echo(platform_warning)
     try:
         import ray  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
@@ -598,6 +629,7 @@ def cluster_worker(
         subprocess.run(
             [_ray_cli_path(), "start", f"--address={head}"],
             check=True,
+            env=ray_env,
         )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         typer.echo(f"Cannot start Ray worker: {exc}", err=True)
@@ -617,6 +649,7 @@ def cluster_status(
     ] = None,
 ) -> None:
     """Print local Ray cluster status."""
+    ray_env = _ray_cluster_env()
     try:
         import ray  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
@@ -631,7 +664,13 @@ def cluster_status(
     if head is not None:
         command.append(f"--address={head}")
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=ray_env,
+        )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         typer.echo(f"Cannot query Ray status: {exc}", err=True)
         raise typer.Exit(code=1) from exc
