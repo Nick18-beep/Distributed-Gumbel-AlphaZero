@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments and package managers
+.venv/
+venv/
+env/
+.env
+.env.*
+pip-wheel-metadata/
+
+# uv
+.uv-cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Test, lint, and type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local runtime artifacts
+artifacts/*
+!artifacts/.gitkeep
+
+# Training outputs if created outside artifacts/
+checkpoints/
+replay/
+logs/
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

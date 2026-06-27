@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gumbel-alphazero"
+version = "0.0.0"
+description = "Local-first framework for real Gumbel AlphaZero self-play training."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Distributed Gumbel AlphaZero contributors" },
+]
+dependencies = [
+  "msgpack",
+  "numpy",
+  "pydantic",
+  "pyyaml",
+  "typer",
+  "zstandard",
+]
+
+[project.optional-dependencies]
+cpu = [
+  "chex",
+  "flax",
+  "jax",
+  "mctx",
+  "optax",
+  "orbax-checkpoint",
+  "pgx",
+  "torch",
+]
+cuda = [
+  "chex",
+  "flax",
+  "jax[cuda13]",
+  "mctx",
+  "optax",
+  "orbax-checkpoint",
+  "pgx",
+  "torch",
+]
+cuda12 = [
+  "chex",
+  "flax",
+  "jax[cuda12]",
+  "mctx",
+  "optax",
+  "orbax-checkpoint",
+  "pgx",
+  "torch",
+]
+dev = [
+  "mypy",
+  "pytest",
+  "pytest-cov",
+  "ruff",
+]
+distributed = [
+  "ray[default]",
+]
+analysis = [
+  "duckdb",
+  "matplotlib",
+  "pandas",
+]
+
+[project.scripts]
+gaz = "gumbel_az.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gumbel_az"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["gumbel_az"]
+strict = true

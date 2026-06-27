@@ -1,0 +1,72 @@
+run:
+  name: connect-four-cpu-debug
+  seed: 7
+  output_dir: artifacts/runs
+
+execution:
+  backend: single_process
+
+cluster:
+  enabled: false
+  head_address: null
+
+install:
+  profile: cpu
+
+storage:
+  backend: filesystem
+  root: artifacts/runs
+
+logging:
+  level: INFO
+  format: jsonl
+
+game:
+  name: connect_four
+  implementation: custom_jax
+
+algorithm:
+  name: gumbel_alphazero
+
+search:
+  backend: mctx
+  simulations_per_move: 8
+  max_num_considered_actions: 7
+  gumbel_scale: 1.0
+  q_transform: completed_by_mix_value
+
+model:
+  name: mlp_small
+  hidden_size: 64
+
+selfplay:
+  games_per_iteration: 4
+  batch_size: 4
+  temperature_moves: 4
+  shard_max_samples: 128
+
+replay:
+  window_samples: 2048
+  min_samples_to_train: 64
+  low_watermark: 128
+  high_watermark: 1024
+
+training:
+  batch_size: 32
+  steps_per_iteration: 4
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  checkpoint_every_steps: 16
+
+eval:
+  enabled: true
+  games: 4
+  promotion_win_rate: 0.55
+
+stop:
+  max_iterations: 1
+  max_train_steps: 4
+  max_games: 8
+  max_wall_time_sec: 60
+

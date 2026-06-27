@@ -1,0 +1,73 @@
+run:
+  name: connect-four-gumbel-az
+  seed: 42
+  output_dir: artifacts/runs
+
+execution:
+  backend: single_process
+
+cluster:
+  enabled: false
+  head_address: null
+
+install:
+  profile: cpu
+
+storage:
+  backend: filesystem
+  root: artifacts/runs
+
+logging:
+  level: INFO
+  format: jsonl
+
+game:
+  name: connect_four
+  implementation: custom_jax
+
+algorithm:
+  name: gumbel_alphazero
+
+search:
+  backend: mctx
+  simulations_per_move: 128
+  max_num_considered_actions: 7
+  gumbel_scale: 1.0
+  q_transform: completed_by_mix_value
+
+model:
+  name: resnet_board
+  channels: 64
+  blocks: 4
+
+selfplay:
+  games_per_iteration: 128
+  batch_size: 128
+  temperature_moves: 12
+  shard_max_samples: 4096
+
+replay:
+  window_samples: 200000
+  min_samples_to_train: 4096
+  low_watermark: 8192
+  high_watermark: 100000
+
+training:
+  batch_size: 256
+  steps_per_iteration: 100
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  checkpoint_every_steps: 1000
+
+eval:
+  enabled: true
+  games: 100
+  promotion_win_rate: 0.55
+
+stop:
+  max_iterations: null
+  max_train_steps: null
+  max_games: null
+  max_wall_time_sec: null
+
