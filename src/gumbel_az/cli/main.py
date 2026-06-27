@@ -16,9 +16,13 @@ from pydantic import ValidationError
 from gumbel_az import __version__
 from gumbel_az.cli.doctor import run_doctor
 from gumbel_az.config import load_config
+from gumbel_az.config.loader import save_resolved_config
 from gumbel_az.config.schema import AppConfig
 from gumbel_az.execution import SingleProcessExecutionBackend
+from gumbel_az.logging import JsonlWriter, MetricWriter
 from gumbel_az.orchestration import load_resume_context
+from gumbel_az.storage import RunPaths, create_run_directory
+from gumbel_az.storage.atomic import atomic_write_json
 
 app = typer.Typer(
     name="gaz",
@@ -70,6 +74,16 @@ def _validate_config(config: Path, overrides: list[str] | None) -> AppConfig:
 def _create_runtime_dirs(root: Path) -> None:
     for relative in ("artifacts", "artifacts/runs", "artifacts/cache"):
         (root / relative).mkdir(parents=True, exist_ok=True)
+
+
+def _create_dev_run(config: AppConfig) -> tuple[RunPaths, JsonlWriter, MetricWriter]:
+    paths = create_run_directory(config)
+    save_resolved_config(config, paths.run_dir)
+    event_writer = JsonlWriter(paths.events_path)
+    metric_writer = MetricWriter(paths.metrics_path)
+    event_writer.write({"event": "run_initialized", "run_id": paths.run_id, "mode": "dev"})
+    metric_writer.write_metrics(0, {"run_initialized": True})
+    return paths, event_writer, metric_writer
 
 
 def _reject_checkpoint_shape_overrides(overrides: list[str] | None) -> None:
@@ -225,22 +239,168 @@ def resume(
 @app.command()
 def selfplay(config: ConfigOption, overrides: OverridesOption = None) -> None:
     """Developer command for self-play only."""
-    _validate_config(config, overrides)
-    _not_implemented(f"gaz selfplay with config {config}", "Fase 15 - Self-play")
+    app_config = _validate_config(config, overrides)
+    try:
+        from gumbel_az.replay import ReplayWriter
+        from gumbel_az.selfplay.worker import SelfPlayWorker
+
+        paths, event_writer, metric_writer = _create_dev_run(app_config)
+        games = min(
+            app_config.stop.max_games or app_config.selfplay.games_per_iteration,
+            app_config.selfplay.games_per_iteration,
+        )
+        worker = SelfPlayWorker(
+            app_config,
+            replay_writer=ReplayWriter(paths.run_dir / "replay"),
+        )
+        _, result = worker.play_batch(games, app_config.run.seed)
+        event_writer.write(
+            {
+                "event": "selfplay_completed",
+                "games": result.games,
+                "positions": result.positions,
+                "replay_shard": result.replay_shard,
+            }
+        )
+        metric_writer.write_metrics(
+            0,
+            {
+                "games_per_sec": result.games_per_sec,
+                "positions_per_sec": result.positions_per_sec,
+                "illegal_action_rate": result.illegal_action_rate,
+                "policy_entropy_mean": result.policy_entropy_mean,
+                "root_value_mean": result.root_value_mean,
+            },
+        )
+        atomic_write_json(
+            paths.run_state_path,
+            {
+                "run_id": paths.run_id,
+                "status": "completed_selfplay",
+                "games_seen": result.games,
+                "samples_seen": result.positions,
+                "replay_shard": result.replay_shard,
+            },
+        )
+    except (KeyError, ValueError, RuntimeError, NotImplementedError) as exc:
+        typer.echo(f"Self-play failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"selfplay completed: {paths.run_dir}")
 
 
 @app.command()
 def train(config: ConfigOption, overrides: OverridesOption = None) -> None:
     """Developer command for training only."""
-    _validate_config(config, overrides)
-    _not_implemented(f"gaz train with config {config}", "Fase 16 - Trainer")
+    app_config = _validate_config(config, overrides)
+    try:
+        from gumbel_az.model.checkpoint import CheckpointManager
+        from gumbel_az.replay import ReplayReader, ReplayWriter
+        from gumbel_az.selfplay.worker import SelfPlayWorker
+        from gumbel_az.training.trainer import Trainer
+
+        paths, event_writer, metric_writer = _create_dev_run(app_config)
+        replay_dir = paths.run_dir / "replay"
+        replay_writer = ReplayWriter(replay_dir)
+        warmup_games = min(
+            app_config.stop.max_games or app_config.selfplay.games_per_iteration,
+            app_config.selfplay.games_per_iteration,
+        )
+        worker = SelfPlayWorker(app_config, replay_writer=replay_writer)
+        _, selfplay_result = worker.play_batch(warmup_games, app_config.run.seed)
+        trainer = Trainer(
+            app_config,
+            replay_reader=ReplayReader(replay_dir),
+            checkpoint_manager=CheckpointManager(paths.run_dir / "checkpoints"),
+            metric_writer=metric_writer,
+        )
+        steps = app_config.training.steps_per_iteration
+        if app_config.stop.max_train_steps is not None:
+            steps = min(steps, app_config.stop.max_train_steps)
+        train_result = trainer.run(max_steps=steps)
+        event_writer.write(
+            {
+                "event": "training_completed",
+                "train_step": train_result.checkpoint_version,
+                "checkpoint_version": train_result.checkpoint_version,
+            }
+        )
+        metric_writer.write_metrics(
+            train_result.checkpoint_version,
+            {
+                "train_samples_per_sec": train_result.samples_per_sec,
+                "replay_sample_age_mean": train_result.replay_sample_age_mean,
+                "checkpoint_version": train_result.checkpoint_version,
+            },
+        )
+        atomic_write_json(
+            paths.run_state_path,
+            {
+                "run_id": paths.run_id,
+                "status": "completed_train",
+                "train_step": train_result.checkpoint_version,
+                "games_seen": selfplay_result.games,
+                "samples_seen": selfplay_result.positions,
+                "replay_shard": selfplay_result.replay_shard,
+                "checkpoint_version": train_result.checkpoint_version,
+            },
+        )
+    except (KeyError, ValueError, RuntimeError, NotImplementedError) as exc:
+        typer.echo(f"Training failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"train completed: {paths.run_dir}")
 
 
 @app.command("eval")
 def eval_command(config: ConfigOption, overrides: OverridesOption = None) -> None:
     """Developer command for evaluation only."""
-    _validate_config(config, overrides)
-    _not_implemented(f"gaz eval with config {config}", "Fase 17 - Evaluation")
+    app_config = _validate_config(config, overrides)
+    try:
+        import jax
+
+        from gumbel_az.envs import create_game
+        from gumbel_az.eval import Arena
+        from gumbel_az.model import create_network
+
+        paths, event_writer, metric_writer = _create_dev_run(app_config)
+        game = create_game(app_config.game.name)
+        network = create_network(app_config.model, num_actions=game.num_actions)
+        params = network.init(
+            jax.random.PRNGKey(app_config.run.seed),
+            game.observation_shape,
+            game.num_actions,
+        )
+        result = Arena(
+            app_config,
+            eval_dir=paths.run_dir / "eval",
+            event_writer=event_writer,
+        ).evaluate_vs_random(params=params, checkpoint_version=0)
+        metric_writer.write_metrics(
+            0,
+            {
+                "eval_win_rate": result.win_rate,
+                "eval_games_per_sec": result.games_per_sec,
+            },
+        )
+        atomic_write_json(
+            paths.run_state_path,
+            {
+                "run_id": paths.run_id,
+                "status": "completed_eval",
+                "eval": {
+                    "checkpoint_version": result.checkpoint_version,
+                    "games": result.games,
+                    "wins": result.wins,
+                    "losses": result.losses,
+                    "draws": result.draws,
+                    "win_rate": result.win_rate,
+                    "games_per_sec": result.games_per_sec,
+                },
+            },
+        )
+    except (KeyError, ValueError, RuntimeError, NotImplementedError) as exc:
+        typer.echo(f"Evaluation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"eval completed: {paths.run_dir}")
 
 
 @app.command()

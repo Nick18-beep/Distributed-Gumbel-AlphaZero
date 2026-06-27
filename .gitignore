@@ -33,9 +33,9 @@ artifacts/*
 !artifacts/.gitkeep
 
 # Training outputs if created outside artifacts/
-checkpoints/
-replay/
-logs/
+/checkpoints/
+/replay/
+/logs/
 *.log
 
 # OS/editor
@@ -43,4 +43,3 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
-

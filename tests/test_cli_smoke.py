@@ -95,17 +95,48 @@ def test_run_initializes_single_process_backend(
     assert (tmp_path / "artifacts" / "runs" / "latest.json").exists()
 
 
-def test_registered_dev_config_commands_report_not_implemented(
+def test_registered_dev_config_commands_run_smoke(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     commands = ("selfplay", "train", "eval")
     monkeypatch.chdir(tmp_path)
 
     for command in commands:
-        result = runner.invoke(app, [command, "--config", str(DEBUG_CONFIG)])
+        result = runner.invoke(
+            app,
+            [
+                command,
+                "--config",
+                str(DEBUG_CONFIG),
+                "--set",
+                "run.output_dir=artifacts/runs",
+                "--set",
+                "selfplay.games_per_iteration=1",
+                "--set",
+                "selfplay.batch_size=1",
+                "--set",
+                "search.simulations_per_move=2",
+                "--set",
+                "replay.min_samples_to_train=1",
+                "--set",
+                "replay.low_watermark=1",
+                "--set",
+                "training.batch_size=4",
+                "--set",
+                "training.steps_per_iteration=1",
+                "--set",
+                "training.checkpoint_every_steps=1",
+                "--set",
+                "eval.games=2",
+                "--set",
+                "stop.max_games=1",
+                "--set",
+                "stop.max_train_steps=1",
+            ],
+        )
 
-        assert result.exit_code == 1
-        assert "not implemented yet" in result.output
+        assert result.exit_code == 0
+        assert f"{command} completed:" in result.output
 
 
 def test_lan_ray_without_ray_reports_optional_dependency(
