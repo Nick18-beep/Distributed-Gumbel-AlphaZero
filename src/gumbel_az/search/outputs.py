@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
-import jax
+import torch
 
 
 class SearchOutput(NamedTuple):
-    policy_target: jax.Array
-    selected_action: jax.Array
-    root_value: jax.Array
-    visit_counts: jax.Array
-    q_values: jax.Array
-    prior_logits: jax.Array
+    policy_target: torch.Tensor
+    selected_action: torch.Tensor
+    root_value: torch.Tensor
+    visit_counts: torch.Tensor
+    q_values: torch.Tensor
+    prior_logits: torch.Tensor
     search_metadata: dict[str, Any]

@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-
-try:
-    import jax
-except ImportError:  # pragma: no cover - exercised only without ML extras.
-    jax = None  # type: ignore[assignment]
+import torch
 
 from gumbel_az.replay.reader import ReplayReader
 
@@ -41,6 +37,48 @@ class ReplaySampler:
             ),
         }
 
+    def tensors_from_arrays(
+        self,
+        arrays: dict[str, np.ndarray],
+        *,
+        pin_memory: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        tensors = {
+            key: torch.as_tensor(value, dtype=torch.float32)
+            for key, value in arrays.items()
+        }
+        if pin_memory:
+            try:
+                tensors = {key: value.pin_memory() for key, value in tensors.items()}
+            except RuntimeError:
+                pass
+        return tensors
+
+    def sample_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        batch_size: int,
+        seed: int,
+        replace_if_needed: bool = False,
+        device: torch.device | str = "cpu",
+    ) -> dict[str, torch.Tensor]:
+        sample_count = int(tensors["observation"].shape[0])
+        if sample_count == 0:
+            raise ValueError("cannot sample from empty replay")
+        replace = replace_if_needed and sample_count < batch_size
+        if not replace and sample_count < batch_size:
+            raise ValueError("not enough replay samples for batch")
+        rng = np.random.default_rng(seed)
+        indices_np = rng.choice(sample_count, size=batch_size, replace=replace)
+        source_device = tensors["observation"].device
+        indices = torch.as_tensor(indices_np, dtype=torch.long, device=source_device)
+        device = torch.device(device)
+        return {
+            key: value.index_select(0, indices).to(device, non_blocking=True)
+            for key, value in tensors.items()
+        }
+
     def sample_arrays(
         self,
         arrays: dict[str, np.ndarray],
@@ -48,25 +86,33 @@ class ReplaySampler:
         batch_size: int,
         seed: int,
         replace_if_needed: bool = False,
-    ):
-        sample_count = int(arrays["observation"].shape[0])
-        if sample_count == 0:
-            raise ValueError("cannot sample from empty replay")
-        replace = replace_if_needed and sample_count < batch_size
-        if not replace and sample_count < batch_size:
-            raise ValueError("not enough replay samples for batch")
-        rng = np.random.default_rng(seed)
-        indices = rng.choice(sample_count, size=batch_size, replace=replace)
-        batch = {key: value[indices] for key, value in arrays.items()}
-        if jax is None:
-            return batch
-        return jax.tree.map(jax.numpy.asarray, batch)
+        device: torch.device | str = "cpu",
+        pin_memory: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        device = torch.device(device)
+        tensors = self.tensors_from_arrays(arrays, pin_memory=pin_memory and device.type == "cuda")
+        return self.sample_tensors(
+            tensors,
+            batch_size=batch_size,
+            seed=seed,
+            replace_if_needed=replace_if_needed,
+            device=device,
+        )
 
-    def sample(self, *, batch_size: int, seed: int):
+    def sample(
+        self,
+        *,
+        batch_size: int,
+        seed: int,
+        device: torch.device | str = "cpu",
+        pin_memory: bool = False,
+    ) -> dict[str, torch.Tensor]:
         arrays = self.arrays_from(self.samples())
         return self.sample_arrays(
             arrays,
             batch_size=batch_size,
             seed=seed,
             replace_if_needed=False,
+            device=device,
+            pin_memory=pin_memory,
         )

@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Annotated, Literal
 
 import typer
@@ -56,6 +57,10 @@ OverridesOption = Annotated[
         help="Override config values with dotted keys, e.g. --set run.seed=123.",
     ),
 ]
+ExecutionOption = Annotated[
+    Literal["single_process", "local_multiprocess", "lan_ray"] | None,
+    typer.Option("--execution", help="Override execution backend for this run."),
+]
 
 
 def _not_implemented(feature: str, roadmap_context: str) -> None:
@@ -70,6 +75,14 @@ def _validate_config(config: Path, overrides: list[str] | None) -> AppConfig:
     except (OSError, ValueError, ValidationError) as exc:
         typer.echo(f"Invalid config {config}: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+
+def _append_override(overrides: list[str] | None, override: str | None) -> list[str] | None:
+    if override is None:
+        return overrides
+    merged = list(overrides or [])
+    merged.append(override)
+    return merged
 
 
 def _create_runtime_dirs(root: Path) -> None:
@@ -145,6 +158,67 @@ def _ray_cluster_platform_warning() -> str | None:
     return None
 
 
+def _apply_ray_cluster_env() -> None:
+    os.environ.update(_ray_cluster_env())
+
+
+def _ray_node_label(node: dict) -> str:
+    address = node.get("NodeManagerAddress") or node.get("NodeManagerHostname") or "unknown"
+    resources = node.get("Resources", {})
+    cpu = resources.get("CPU", 0)
+    gpu = resources.get("GPU", 0)
+    return f"{address} cpu={cpu:g} gpu={gpu:g}"
+
+
+def _wait_for_ray_workers(
+    *,
+    head: str,
+    min_workers: int,
+    timeout_sec: float,
+    poll_sec: float,
+) -> None:
+    _apply_ray_cluster_env()
+    try:
+        import ray  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        typer.echo("Ray is not installed; run `uv sync --extra distributed`.", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        sys.modules.pop("ray", None)
+        typer.echo(f"Ray could not be imported: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if not ray.is_initialized():
+        ray.init(address=head, ignore_reinit_error=True)
+
+    typer.echo(f"waiting for {min_workers} Ray worker(s) at {head}...")
+    seen_node_ids: set[str] = set()
+    last_worker_count = -1
+    deadline = monotonic() + timeout_sec
+    while True:
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        for node in alive_nodes:
+            node_id = str(node.get("NodeID", _ray_node_label(node)))
+            if node_id not in seen_node_ids:
+                seen_node_ids.add(node_id)
+                typer.echo(f"ray node connected: {_ray_node_label(node)}")
+
+        worker_count = max(0, len(alive_nodes) - 1)
+        if worker_count != last_worker_count:
+            last_worker_count = worker_count
+            typer.echo(f"ray workers ready: {worker_count}/{min_workers}")
+        if worker_count >= min_workers:
+            typer.echo(f"required Ray workers connected: {worker_count}/{min_workers}")
+            return
+        if monotonic() >= deadline:
+            typer.echo(
+                f"Timed out waiting for Ray workers: {worker_count}/{min_workers} connected.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        sleep(poll_sec)
+
+
 def _prompt_int(label: str) -> int | None:
     typer.echo(f"{label}: ", nl=False)
     line = sys.stdin.readline()
@@ -185,7 +259,7 @@ def doctor(
     ] = False,
     cuda: Annotated[
         bool,
-        typer.Option("--cuda", help="Diagnose JAX CUDA/GPU availability."),
+        typer.Option("--cuda", help="Diagnose PyTorch CUDA/GPU availability."),
     ] = False,
 ) -> None:
     """Run environment checks."""
@@ -193,9 +267,14 @@ def doctor(
 
 
 @app.command()
-def run(config: ConfigOption, overrides: OverridesOption = None) -> None:
+def run(
+    config: ConfigOption,
+    overrides: OverridesOption = None,
+    execution: ExecutionOption = None,
+) -> None:
     """Run a training orchestration from a config file."""
-    app_config = _validate_config(config, overrides)
+    execution_override = None if execution is None else f"execution.backend={execution}"
+    app_config = _validate_config(config, _append_override(overrides, execution_override))
     try:
         if app_config.execution.backend == "single_process":
             result = SingleProcessExecutionBackend().run(app_config)
@@ -259,7 +338,14 @@ def resume(
 
 
 @app.command()
-def selfplay(config: ConfigOption, overrides: OverridesOption = None) -> None:
+def selfplay(
+    config: ConfigOption,
+    overrides: OverridesOption = None,
+    games: Annotated[
+        int | None,
+        typer.Option("--games", min=1, help="Number of self-play games to generate."),
+    ] = None,
+) -> None:
     """Developer command for self-play only."""
     app_config = _validate_config(config, overrides)
     try:
@@ -267,15 +353,17 @@ def selfplay(config: ConfigOption, overrides: OverridesOption = None) -> None:
         from gumbel_az.selfplay.worker import SelfPlayWorker
 
         paths, event_writer, metric_writer = _create_dev_run(app_config)
-        games = min(
-            app_config.stop.max_games or app_config.selfplay.games_per_iteration,
-            app_config.selfplay.games_per_iteration,
-        )
+        games_to_play = games
+        if games_to_play is None:
+            games_to_play = min(
+                app_config.stop.max_games or app_config.selfplay.games_per_iteration,
+                app_config.selfplay.games_per_iteration,
+            )
         worker = SelfPlayWorker(
             app_config,
             replay_writer=ReplayWriter(paths.run_dir / "replay"),
         )
-        _, result = worker.play_batch(games, app_config.run.seed)
+        _, result = worker.play_batch(games_to_play, app_config.run.seed)
         event_writer.write(
             {
                 "event": "selfplay_completed",
@@ -377,25 +465,27 @@ def eval_command(config: ConfigOption, overrides: OverridesOption = None) -> Non
     """Developer command for evaluation only."""
     app_config = _validate_config(config, overrides)
     try:
-        import jax
-
         from gumbel_az.envs import create_game
         from gumbel_az.eval import Arena
         from gumbel_az.model import create_network
+        from gumbel_az.runtime import detect_torch_runtime
 
         paths, event_writer, metric_writer = _create_dev_run(app_config)
         game = create_game(app_config.game.name)
         network = create_network(app_config.model, num_actions=game.num_actions)
-        params = network.init(
-            jax.random.PRNGKey(app_config.run.seed),
+        runtime = detect_torch_runtime()
+        model = network.init(
+            app_config.run.seed,
             game.observation_shape,
             game.num_actions,
+            device=runtime.device,
         )
         result = Arena(
             app_config,
             eval_dir=paths.run_dir / "eval",
             event_writer=event_writer,
-        ).evaluate_vs_random(params=params, checkpoint_version=0)
+            device=runtime.device,
+        ).evaluate_vs_random(model=model, checkpoint_version=0)
         metric_writer.write_metrics(
             0,
             {
@@ -461,7 +551,7 @@ def play(
         app_config = _validate_config(config, overrides)
     from gumbel_az.envs import create_game
     from gumbel_az.play import play_scripted_game, result_message
-    from gumbel_az.play.session import AgentPlayer, apply_human_action, load_play_params
+    from gumbel_az.play.session import AgentPlayer, apply_human_action, load_play_model
 
     if moves is not None:
         result = play_scripted_game(
@@ -475,12 +565,10 @@ def play(
         typer.echo(result.message)
         raise typer.Exit(code=0)
 
-    import jax
-
     game = create_game(app_config.game.name)
-    params = load_play_params(app_config, run_dir=run_dir, checkpoint=checkpoint)
-    agent = AgentPlayer(app_config, params=params)
-    state = game.init(jax.random.PRNGKey(app_config.run.seed))
+    model = load_play_model(app_config, run_dir=run_dir, checkpoint=checkpoint)
+    agent = AgentPlayer(app_config, model=model)
+    state = game.init(app_config.run.seed)
     while not bool(game.is_terminal(state)):
         typer.echo(game.render_text(state))
         current_player = int(game.current_player(state))
@@ -505,12 +593,25 @@ def play(
 
 
 @app.command()
-def benchmark(config: ConfigOption, overrides: OverridesOption = None) -> None:
+def benchmark(
+    config: ConfigOption,
+    overrides: OverridesOption = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            file_okay=False,
+            dir_okay=True,
+            writable=True,
+            help="Directory where benchmark JSONL output is written.",
+        ),
+    ] = None,
+) -> None:
     """Run project benchmarks."""
     app_config = _validate_config(config, overrides)
     from gumbel_az.benchmark import run_benchmark
 
-    output_path = run_benchmark(app_config)
+    output_path = run_benchmark(app_config, output_dir=output_dir)
     typer.echo(f"benchmark written: {output_path}")
 
 
@@ -560,6 +661,22 @@ def cluster_head(
         ),
     ] = "0.0.0.0",
     port: Annotated[int, typer.Option("--port", min=1, max=65535, help="Ray head port.")] = 6379,
+    wait_workers: Annotated[
+        bool,
+        typer.Option("--wait-workers", help="Keep this terminal open until workers connect."),
+    ] = False,
+    min_workers: Annotated[
+        int,
+        typer.Option("--min-workers", min=0, help="Minimum Ray worker nodes to wait for."),
+    ] = 1,
+    timeout_sec: Annotated[
+        float,
+        typer.Option("--timeout-sec", min=1.0, help="Seconds to wait for workers."),
+    ] = 300.0,
+    poll_sec: Annotated[
+        float,
+        typer.Option("--poll-sec", min=0.1, help="Worker polling interval in seconds."),
+    ] = 2.0,
 ) -> None:
     """Start a Ray head node."""
     _validate_config(config, overrides)
@@ -598,6 +715,13 @@ def cluster_head(
     typer.echo(f"ray head ready: {node_ip}:{port}")
     if node_ip != host:
         typer.echo(f"bind host {host!r} resolved to Ray node IP {node_ip!r}")
+    if wait_workers:
+        _wait_for_ray_workers(
+            head=f"{node_ip}:{port}",
+            min_workers=min_workers,
+            timeout_sec=timeout_sec,
+            poll_sec=poll_sec,
+        )
 
 
 @cluster_app.command("worker")
@@ -639,6 +763,31 @@ def cluster_worker(
         typer.echo(json.dumps(capabilities.__dict__, sort_keys=True))
     else:
         typer.echo(f"ray worker connected: {head}")
+
+
+@cluster_app.command("wait")
+def cluster_wait(
+    head: Annotated[str, typer.Option("--head", help="Ray head address host:port.")],
+    min_workers: Annotated[
+        int,
+        typer.Option("--min-workers", min=0, help="Minimum Ray worker nodes to wait for."),
+    ] = 1,
+    timeout_sec: Annotated[
+        float,
+        typer.Option("--timeout-sec", min=1.0, help="Seconds to wait for workers."),
+    ] = 300.0,
+    poll_sec: Annotated[
+        float,
+        typer.Option("--poll-sec", min=0.1, help="Worker polling interval in seconds."),
+    ] = 2.0,
+) -> None:
+    """Wait for Ray worker nodes and log them as they connect."""
+    _wait_for_ray_workers(
+        head=head,
+        min_workers=min_workers,
+        timeout_sec=timeout_sec,
+        poll_sec=poll_sec,
+    )
 
 
 @cluster_app.command("status")

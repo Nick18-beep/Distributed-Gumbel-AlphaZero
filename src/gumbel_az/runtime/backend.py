@@ -1,20 +1,19 @@
-"""Detect the active ML runtime backend."""
+"""Detect the active PyTorch runtime backend."""
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
-import os
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class RuntimeBackend:
     name: str
-    jax_available: bool
     torch_available: bool
+    device: str
+    device_count: int
     reason: str
-
 
 def _can_import(module_name: str) -> tuple[bool, str]:
     try:
@@ -30,55 +29,43 @@ def _can_import(module_name: str) -> tuple[bool, str]:
     return True, "available"
 
 
-def detect_runtime_backend() -> RuntimeBackend:
-    jax_available, jax_reason = _can_import("jax")
+def detect_torch_runtime() -> RuntimeBackend:
     torch_available, torch_reason = _can_import("torch")
-    forced = os.environ.get("GAZ_FORCE_RUNTIME_BACKEND", "").strip().lower()
-    if forced and forced not in {"jax", "torch"}:
+    if not torch_available:
         return RuntimeBackend(
             name="none",
-            jax_available=jax_available,
-            torch_available=torch_available,
-            reason=f"unsupported GAZ_FORCE_RUNTIME_BACKEND={forced!r}; expected 'jax' or 'torch'",
-        )
-    if forced == "torch":
-        if torch_available:
-            return RuntimeBackend(
-                name="torch",
-                jax_available=jax_available,
-                torch_available=True,
-                reason="GAZ_FORCE_RUNTIME_BACKEND=torch; using PyTorch fallback",
-            )
-        return RuntimeBackend(
-            name="none",
-            jax_available=jax_available,
             torch_available=False,
-            reason=f"GAZ_FORCE_RUNTIME_BACKEND=torch but PyTorch unavailable ({torch_reason})",
+            device="none",
+            device_count=0,
+            reason=f"PyTorch unavailable ({torch_reason})",
         )
-    if forced == "jax" and not jax_available:
-        return RuntimeBackend(
-            name="none",
-            jax_available=False,
-            torch_available=torch_available,
-            reason=f"GAZ_FORCE_RUNTIME_BACKEND=jax but JAX unavailable ({jax_reason})",
-        )
-    if jax_available:
-        return RuntimeBackend(
-            name="jax",
-            jax_available=True,
-            torch_available=torch_available,
-            reason="JAX available; using primary backend",
-        )
-    if torch_available:
+
+    import torch
+
+    if torch.cuda.is_available():
         return RuntimeBackend(
             name="torch",
-            jax_available=False,
             torch_available=True,
-            reason=f"JAX unavailable ({jax_reason}); using PyTorch fallback",
+            device="cuda",
+            device_count=torch.cuda.device_count(),
+            reason="PyTorch available; using CUDA",
+        )
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return RuntimeBackend(
+            name="torch",
+            torch_available=True,
+            device="mps",
+            device_count=1,
+            reason="PyTorch available; using Apple MPS",
         )
     return RuntimeBackend(
-        name="none",
-        jax_available=False,
-        torch_available=False,
-        reason=f"JAX unavailable ({jax_reason}); PyTorch unavailable ({torch_reason})",
+        name="torch",
+        torch_available=True,
+        device="cpu",
+        device_count=1,
+        reason="PyTorch available; using CPU",
     )
+
+
+def detect_runtime_backend() -> RuntimeBackend:
+    return detect_torch_runtime()

@@ -1,8 +1,8 @@
 # Distributed Gumbel AlphaZero
 
 Framework local-first per addestrare agenti self-play su giochi a informazione perfetta.
-Il target corrente e' Connect Four con una implementazione reale di Gumbel AlphaZero
-basata su JAX/Flax/Optax, MCTX, replay locale, checkpoint Orbax, evaluation e CLI.
+Il target corrente e' Connect Four con Gumbel AlphaZero PyTorch-native, replay locale,
+checkpoint PyTorch, evaluation, CLI e distribuzione opzionale con Ray.
 
 ## Quickstart CPU
 
@@ -12,7 +12,7 @@ uv run gaz doctor
 uv run gaz run --config configs/connect_four.yaml
 ```
 
-Per smoke test rapidi su laptop:
+Smoke test rapido:
 
 ```bash
 uv run gaz run --config configs/connect_four_cpu_debug.yaml
@@ -20,7 +20,8 @@ uv run gaz run --config configs/connect_four_cpu_debug.yaml
 
 ## Quickstart GPU
 
-JAX GPU NVIDIA non e' supportato su Windows nativo. Per CUDA usare Linux o WSL2.
+CUDA NVIDIA e' supportata tramite PyTorch su Windows nativo e Linux quando driver e
+runtime NVIDIA sono gia' installati correttamente.
 
 ```bash
 python scripts/bootstrap.py --profile cuda
@@ -28,68 +29,32 @@ uv run gaz doctor --cuda
 uv run gaz run --config configs/connect_four_gpu.yaml
 ```
 
-Se serve CUDA 12:
-
-```bash
-python scripts/bootstrap.py --profile cuda12
-```
-
-## Quickstart Windows
-
-Windows nativo e' supportato come piattaforma CPU:
-
-```powershell
-python scripts/bootstrap.py --profile cpu --profile dev
-uv run gaz doctor
-uv run pytest
-uv run gaz run --config configs/connect_four_cpu_debug.yaml
-```
-
-CUDA su Windows nativo non viene promessa: usare WSL2/Linux.
-
-## Quickstart Linux/WSL
-
-```bash
-python scripts/bootstrap.py --profile cpu --profile dev
-uv run gaz doctor
-uv run pytest
-uv run gaz run --config configs/connect_four_cpu_debug.yaml
-```
+Python supportato: 3.11, 3.12, 3.13. Python 3.14 non e' supportato per ora.
 
 ## Quickstart LAN Ray
 
-Ray e' opzionale e sta dietro `ExecutionBackend`. Il progetto deve funzionare senza
-Ray installato. Per LAN:
+Ray e' opzionale e sta dietro `ExecutionBackend`.
+
+Master/head:
 
 ```bash
-python scripts/bootstrap.py --profile cpu --profile distributed
-uv run gaz doctor --distributed
+uv run --extra cpu --extra distributed gaz cluster head --config configs/connect_four_lan.yaml --host 0.0.0.0 --port 6379 --wait-workers --min-workers 1
 ```
-
-Head:
-
-```bash
-uv run gaz cluster head --config configs/connect_four_lan.yaml --host 0.0.0.0 --port 6379
-```
-
-Il comando stampa un indirizzo del tipo `ray head ready: 192.168.1.50:6379`.
-Usare quell'IP LAN reale nei comandi worker e run. Non usare letteralmente
-`HEAD_IP` o `MASTER_IP`, e non usare `0.0.0.0` come indirizzo di connessione.
 
 Worker:
 
 ```bash
-uv run gaz cluster worker --head 192.168.1.50:6379 --config configs/connect_four_lan.yaml --auto
+uv run --extra cpu --extra distributed gaz cluster worker --head 192.168.1.50:6379 --config configs/connect_four_lan.yaml --auto
 ```
 
-Run LAN:
+Training LAN dal master:
 
 ```bash
-uv run gaz run --config configs/connect_four_lan.yaml --set cluster.head_address=192.168.1.50:6379
+uv run --extra cpu --extra distributed gaz run --config configs/connect_four_lan.yaml --execution lan_ray --set cluster.head_address=192.168.1.50:6379
 ```
 
-Se Ray non e' installato, i comandi LAN falliscono con un errore esplicito e il resto
-del progetto resta utilizzabile.
+Su Windows/macOS la CLI imposta automaticamente
+`RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1` per i comandi Ray multi-node.
 
 ## Comandi principali
 
@@ -99,92 +64,68 @@ uv run gaz doctor --fix
 uv run gaz doctor --cuda
 uv run gaz doctor --distributed
 uv run gaz run --config configs/connect_four.yaml
+uv run gaz run --config configs/connect_four.yaml --execution local_multiprocess
+uv run gaz run --config configs/connect_four_lan.yaml --execution lan_ray --set cluster.head_address=HEAD_IP:6379
+uv run gaz selfplay --config configs/connect_four_cpu_debug.yaml --games 2
+uv run gaz train --config configs/connect_four_cpu_debug.yaml
+uv run gaz eval --config configs/connect_four_cpu_debug.yaml
 uv run gaz resume artifacts/runs/<run_id>
 uv run gaz play --config configs/connect_four.yaml --run-dir artifacts/runs/<run_id>
-uv run gaz benchmark --config configs/connect_four_cpu_debug.yaml
+uv run gaz benchmark --config configs/connect_four_cpu_debug.yaml --output-dir artifacts/benchmarks
 uv run gaz inspect run artifacts/runs/<run_id>
 uv run gaz inspect replay artifacts/runs/<run_id>/replay
 uv run gaz inspect checkpoint artifacts/runs/<run_id>/checkpoints
 ```
 
-## Artifact runtime
+`gaz run --execution ...` e' un alias pratico per `--set execution.backend=...`.
+`--set dotted.key=value` resta disponibile per ogni override puntuale.
 
-Ogni run scrive:
+## Artifact runtime
 
 ```text
 artifacts/runs/<run_id>/
   config.resolved.yaml
   run_state.json
-  logs/
-    events.jsonl
-    metrics.jsonl
-  replay/
-    shards/
-    index.json
-    quarantine/
-  checkpoints/
-    index.json
-    latest.json
-    best.json
-  eval/
-    matches.jsonl
+  logs/events.jsonl
+  logs/metrics.jsonl
+  replay/shards/
+  replay/index.json
+  replay/quarantine/
+  checkpoints/index.json
+  checkpoints/latest.json
+  checkpoints/best.json
+  checkpoints/ckpt_000001/checkpoint.pt
+  eval/matches.jsonl
 ```
 
-Replay usa msgpack + zstd, con shard append-only e import atomico. Checkpoint usa
-Orbax con registry JSON atomico.
+Replay usa msgpack + zstd con shard append-only. Checkpoint usa `torch.save`
+atomico con registry JSON.
 
 ## Gumbel AlphaZero
 
 Il path primario usa:
 
-- Connect Four custom JAX-friendly;
-- network Flax (`mlp_small` per debug, `resnet_board` per preset reale);
-- MCTX `gumbel_muzero_policy`;
+- Connect Four NumPy/PyTorch-friendly;
+- modelli PyTorch (`mlp_small`, `resnet_board`);
+- backend search `torch_gumbel`;
 - legal masking obbligatorio;
-- recurrent function con dinamica reale del gioco;
-- replay target con policy migliorata e value dalla prospettiva di `to_play`;
-- training JIT con AdamW, cosine schedule, clipping e checkpoint.
+- Gumbel root noise, candidate set, sequential halving e Q transform;
+- policy target migliorata e value target dalla prospettiva di `to_play`;
+- training PyTorch con AdamW, cosine schedule, clipping, AMP CUDA, `training.compile`
+  in modalita' `auto|on|off` e checkpoint.
 
-Se JAX non e' disponibile, il runtime puo' usare fallback PyTorch per mantenere
-diagnostica e replay operativo. Il fallback e' loggato chiaramente come
-`runtime_backend=torch` e non viene mascherato come path Gumbel/MCTX primario.
-
-## Aggiungere un gioco
-
-1. Implementare il contratto `GameAdapter` in `src/gumbel_az/envs/custom/<game>.py`
-   oppure dietro un adapter a libreria matura.
-2. Registrare il gioco in `src/gumbel_az/envs/registry.py`.
-3. Aggiungere una config dedicata in `configs/`.
-4. Aggiungere test di contratto, legal mask, terminal rewards e self-play smoke.
-
-Il training loop non deve cambiare quando si aggiunge un gioco.
-
-## Aggiungere un algoritmo
-
-Il registry algoritmi deve contenere solo algoritmi realmente implementati e testati.
-Oggi il solo algoritmo registrato e' `gumbel_alphazero`. Un nuovo algoritmo deve
-passare da `TrainingAlgorithm`, usare config dedicata e non modificare il
-`GameAdapter`.
-
-## Aggiungere un modello
-
-1. Implementare la factory in `src/gumbel_az/model/`.
-2. Registrarla nel model registry.
-3. Accettare `observation_shape` e `num_actions` dal gioco.
-4. Aggiungere test init/forward/shape.
+JAX, Flax, Optax, Orbax, MCTX, Chex e PGX non sono runtime attivi del progetto.
 
 ## Troubleshooting
 
 - `Ray is not installed`: eseguire `uv sync --extra distributed`.
-- `jax backend: cpu` su Windows: e' atteso su Windows nativo.
-- CUDA NVIDIA: usare Linux/WSL2 e profilo `cuda` o `cuda12`.
-- Replay corrotto: `gaz inspect replay ...` mostra `read_errors`; gli shard corrotti
-  vengono messi in `quarantine/` quando rilevati.
-- Checkpoint mancante: controllare `checkpoints/latest.json` e `checkpoints/best.json`.
+- `torch cuda available: False`: controllare driver NVIDIA e installazione PyTorch CUDA.
+- Worker macOS/Windows Ray: usare i comandi `gaz cluster ...`; la CLI imposta la variabile Ray richiesta.
+- Replay corrotto: `gaz inspect replay ...` mostra `read_errors`; gli shard corrotti vanno in `quarantine/`.
+- Checkpoint mancante: controllare `checkpoints/latest.json`, `checkpoints/best.json` e `checkpoint.pt`.
 
 ## Limiti noti
 
 - LAN Ray e' opzionale e richiede extra `distributed`.
-- Test Linux/WSL richiedono una distro WSL o CI Linux disponibile.
 - Docker e database server non sono richiesti.
 - Il bootstrap remoto automatico multi-PC non fa parte della roadmap corrente.

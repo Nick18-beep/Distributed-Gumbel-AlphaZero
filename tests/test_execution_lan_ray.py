@@ -4,7 +4,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
-import jax.numpy as jnp
+import numpy as np
 import pytest
 
 import gumbel_az.execution.lan_ray as lan_ray_module
@@ -38,6 +38,9 @@ class _FakeRay:
         self.init_calls.append(kwargs)
         self._initialized = True
 
+    def nodes(self) -> list[dict]:
+        return [{"Alive": True, "NodeID": "head"}]
+
 
 def _capabilities(worker_id: str = "worker-1") -> WorkerCapabilities:
     return WorkerCapabilities(
@@ -45,8 +48,9 @@ def _capabilities(worker_id: str = "worker-1") -> WorkerCapabilities:
         hostname="host",
         platform="test",
         cpu_count=4,
-        runtime_backend="jax",
-        jax_devices=("cpu:0",),
+        runtime_backend="torch",
+        torch_device="cpu",
+        torch_devices=("cpu",),
         has_gpu=False,
     )
 
@@ -55,9 +59,9 @@ def _sample(index: int = 0) -> dict:
     return {
         "game_name": "connect_four",
         "algorithm_name": "gumbel_alphazero",
-        "state_or_observation": jnp.zeros((6, 7, 2), dtype=jnp.float32),
-        "legal_action_mask": jnp.asarray([True, True, False, True, True, True, True]),
-        "policy_target": jnp.asarray([0.2, 0.2, 0.0, 0.2, 0.2, 0.1, 0.1]),
+        "state_or_observation": np.zeros((6, 7, 2), dtype=np.float32),
+        "legal_action_mask": np.asarray([True, True, False, True, True, True, True]),
+        "policy_target": np.asarray([0.2, 0.2, 0.0, 0.2, 0.2, 0.1, 0.1]),
         "value_target": 1.0 if index % 2 == 0 else -1.0,
         "to_play": index % 2,
         "move_index": index,

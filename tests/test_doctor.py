@@ -94,6 +94,6 @@ def test_doctor_cuda_reports_clear_diagnostic(
 
     result = runner.invoke(app, ["doctor", "--cuda"])
 
-    assert "jax devices" in result.output or "[ERROR] jax:" in result.output
+    assert "torch cuda available" in result.output or "[ERROR] torch:" in result.output
     if result.exit_code != 0:
-        assert "cuda" in result.output.lower() or "jax" in result.output.lower()
+        assert "cuda" in result.output.lower() or "torch" in result.output.lower()

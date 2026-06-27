@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import jax.numpy as jnp
+import numpy as np
 
 from gumbel_az.config import load_config
 from gumbel_az.replay import ReplayReader, ReplayWriter
@@ -29,9 +29,9 @@ def test_selfplay_generates_replay_and_is_deterministic(tmp_path: Path) -> None:
         step.action for step in trajectories_b[0].steps
     ]
     for sample in samples:
-        legal = jnp.asarray(sample["legal_action_mask"])
-        policy = jnp.asarray(sample["policy_target"])
-        assert float(jnp.sum(policy[~legal])) == 0.0
+        legal = np.asarray(sample["legal_action_mask"], dtype=bool)
+        policy = np.asarray(sample["policy_target"], dtype=np.float32)
+        assert float(np.sum(policy[~legal])) == 0.0
         assert -1.0 <= sample["value_target"] <= 1.0
 
 

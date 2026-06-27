@@ -2,6 +2,19 @@
 
 Questa checklist serve per implementare il progetto uno step alla volta. Spunta manualmente con `[X]` quando completi un task.
 
+## Override runtime ML corrente
+
+Da questa revisione il progetto e' PyTorch-only. Non modificare i flag gia'
+spuntati, ma interpreta ogni vecchia voce JAX/Flax/Optax/Orbax/MCTX/Chex/PGX
+come sostituita dal corrispondente task PyTorch:
+
+- extra `cpu`/`cuda`: PyTorch;
+- `cuda12`: rimosso;
+- doctor: diagnostica PyTorch/CUDA/MPS;
+- Connect Four: implementazione `torch`;
+- search: backend `torch_gumbel`;
+- training/checkpoint/eval/Ray: PyTorch.
+
 ---
 
 ## Fase 0 â€” Setup repository
@@ -23,19 +36,19 @@ Questa checklist serve per implementare il progetto uno step alla volta. Spunta 
 - [X] Definire package `gumbel_az` con layout `src/`.
 - [X] Definire comando CLI `gaz`.
 - [X] Aggiungere dipendenze base leggere: Pydantic, Typer, PyYAML, NumPy, msgpack, zstandard.
-- [X] Aggiungere extra `cpu` con JAX, Flax, Optax, Orbax, Chex, mctx, pgx.
-- [X] Aggiungere extra `cuda` con JAX GPU CUDA 13, mctx e pgx secondo documentazione ufficiale aggiornata.
-- [X] Aggiungere extra `cuda12` con mctx e pgx se serve supporto esplicito CUDA 12.
+- [X] Aggiungere extra `cpu` con PyTorch.
+- [X] Aggiungere extra `cuda` con PyTorch CUDA secondo packaging ufficiale PyTorch.
+- [X] Rimuovere extra `cuda12` legacy.
 - [X] Aggiungere extra `dev` con pytest, pytest-cov, ruff, mypy.
 - [X] Aggiungere extra `distributed` con Ray.
 - [X] Aggiungere extra `analysis` con DuckDB, Pandas, Matplotlib.
-- [X] Documentare che JAX GPU NVIDIA non Ã¨ supportato su Windows nativo e richiede Linux/WSL2 dove applicabile.
+- [X] Documentare che CUDA NVIDIA e' supportata tramite PyTorch su Windows/Linux.
 - [X] Valutare librerie mature prima di introdurre implementazioni custom.
 - [X] Tenere librerie esterne dietro adapter/wrapper dove toccano dominio, search, storage o execution.
 - [X] Generare `uv.lock`.
 - [X] Verificare `uv sync --extra cpu`.
 - [X] Verificare `uv run python -c "import gumbel_az"`.
-- [X] Verificare che import base non richieda JAX se extra ML non installati.
+- [X] Verificare che import base non richieda PyTorch se extra ML non installati.
 
 ---
 
@@ -46,7 +59,7 @@ Questa checklist serve per implementare il progetto uno step alla volta. Spunta 
 - [X] Installare `uv` automaticamente se manca.
 - [X] Supportare `--profile cpu`.
 - [X] Supportare `--profile cuda`.
-- [X] Supportare `--profile cuda12` se configurato.
+- [X] Rimuovere `--profile cuda12` legacy.
 - [X] Supportare `--profile dev`.
 - [X] Supportare `--profile distributed`.
 - [X] Supportare `--profile analysis`.
@@ -86,18 +99,18 @@ Questa checklist serve per implementare il progetto uno step alla volta. Spunta 
 - [X] Controllare ambiente virtuale.
 - [X] Controllare sistema operativo e distinguere Windows, Linux e WSL.
 - [X] Controllare import pacchetti base.
-- [X] Controllare import JAX se profilo ML installato.
-- [X] Stampare `jax.devices()` se JAX Ã¨ installato.
+- [X] Controllare import PyTorch se profilo ML installato.
+- [X] Stampare device PyTorch, CUDA e MPS se disponibili.
 - [X] Distinguere chiaramente backend CPU/GPU.
-- [X] Controllare import Flax.
-- [X] Controllare import Optax.
-- [X] Controllare import Orbax.
+- [X] Rimuovere controlli Flax legacy.
+- [X] Rimuovere controlli Optax legacy.
+- [X] Rimuovere controlli Orbax legacy.
 - [X] Controllare scrittura in `artifacts/`.
 - [X] Controllare presenza config Connect Four.
 - [X] Implementare `gaz doctor --fix` per fix sicuri.
 - [X] Implementare `gaz doctor --distributed` per controllare Ray.
 - [X] Implementare `gaz doctor --cuda` per diagnosi GPU.
-- [X] Aggiungere output chiaro sui limiti CUDA/JAX per Windows nativo.
+- [X] Aggiungere output chiaro su CUDA PyTorch per Windows/Linux e MPS macOS.
 - [X] Aggiungere test per doctor.
 - [X] Eseguire test doctor su Windows e Linux/WSL o CI Linux.
 

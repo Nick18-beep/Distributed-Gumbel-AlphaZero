@@ -70,14 +70,14 @@ def test_local_multiprocess_records_worker_failure(tmp_path: Path) -> None:
 
 
 def test_local_multiprocess_records_parent_training_failure(tmp_path: Path, monkeypatch) -> None:
-    class FailingTrainer:
+    class FailingOrchestrator:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def run(self, *, max_steps: int | None = None):
+        def run(self):
             raise RuntimeError("trainer boom")
 
-    monkeypatch.setattr(local_multiprocess_module, "Trainer", FailingTrainer)
+    monkeypatch.setattr(local_multiprocess_module, "RunOrchestrator", FailingOrchestrator)
     config = load_config(
         DEBUG_CONFIG,
         [

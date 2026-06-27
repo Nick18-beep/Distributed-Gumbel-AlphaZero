@@ -1,20 +1,19 @@
-"""Action masking helpers."""
+"""Legal action masking helpers for PyTorch tensors."""
 
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
+import torch
 
 
 def apply_legal_mask(
-    logits: jax.Array,
-    legal_mask: jax.Array,
+    logits: torch.Tensor,
+    legal_mask: torch.Tensor,
     illegal_value: float = -1.0e9,
-) -> jax.Array:
-    return jnp.where(legal_mask, logits, jnp.asarray(illegal_value, dtype=logits.dtype))
+) -> torch.Tensor:
+    return torch.where(legal_mask.bool(), logits, torch.full_like(logits, illegal_value))
 
 
-def masked_policy(logits: jax.Array, legal_mask: jax.Array) -> jax.Array:
+def masked_policy(logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
     masked_logits = apply_legal_mask(logits, legal_mask)
-    probs = jax.nn.softmax(masked_logits, axis=-1)
-    return jnp.where(legal_mask, probs, jnp.zeros_like(probs))
+    probs = torch.softmax(masked_logits, dim=-1)
+    return torch.where(legal_mask.bool(), probs, torch.zeros_like(probs))

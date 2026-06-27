@@ -5,14 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import jax
+import numpy as np
 
 
 @dataclass(frozen=True)
 class TrajectoryStep:
-    observation: jax.Array
-    legal_action_mask: jax.Array
-    policy_target: jax.Array
+    observation: np.ndarray
+    legal_action_mask: np.ndarray
+    policy_target: np.ndarray
     action: int
     root_value: float
     to_play: int
@@ -27,4 +27,4 @@ class Trajectory:
     algorithm_name: str
     model_version: int
     steps: list[TrajectoryStep]
-    final_rewards: jax.Array
+    final_rewards: np.ndarray

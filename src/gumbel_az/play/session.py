@@ -7,14 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import jax
+import torch
 
 from gumbel_az.algorithms import create_algorithm
 from gumbel_az.config.schema import AppConfig
 from gumbel_az.envs import create_game
 from gumbel_az.model import create_network
 from gumbel_az.model.checkpoint import CheckpointManager
-from gumbel_az.search import MctxSearchBackend
+from gumbel_az.runtime import detect_torch_runtime
+from gumbel_az.search import TorchGumbelSearchBackend
 
 CheckpointSelector = Literal["latest", "best"]
 
@@ -28,28 +29,60 @@ class PlayResult:
 
 
 class AgentPlayer:
-    def __init__(self, config: AppConfig, *, params: Any) -> None:
+    def __init__(self, config: AppConfig, *, model: torch.nn.Module) -> None:
         self.config = config
+        self.runtime = detect_torch_runtime()
+        self.device = torch.device(self.runtime.device)
         self.game = create_game(config.game.name)
-        self.network = create_network(config.model, num_actions=self.game.num_actions)
+        self.model = model.to(self.device)
+        self.model.eval()
         self.algorithm = create_algorithm(
             config,
             game=self.game,
-            search_backend=MctxSearchBackend(),
+            search_backend=TorchGumbelSearchBackend(game=self.game, device=self.device),
         )
-        self.params = params
 
     def select_action(self, state: Any, *, seed: int) -> int:
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(seed)
+
         def network_apply(observations):
-            return self.network.apply(self.params, observations, train=False)
+            self.model.eval()
+            return self.model(observations.to(self.device, non_blocking=True))
 
         output = self.algorithm.select_action(
             game_state=state,
             network_apply=network_apply,
-            rng_key=jax.random.PRNGKey(seed),
+            rng=generator,
             temperature=0.0,
         )
-        return int(output.selected_action)
+        return int(output.selected_action.detach().cpu().item())
+
+
+def load_play_model(
+    config: AppConfig,
+    *,
+    run_dir: Path | None = None,
+    checkpoint: CheckpointSelector = "best",
+) -> torch.nn.Module:
+    game = create_game(config.game.name)
+    network = create_network(config.model, num_actions=game.num_actions)
+    runtime = detect_torch_runtime()
+    model = network.init(
+        config.run.seed,
+        game.observation_shape,
+        game.num_actions,
+        device=runtime.device,
+    )
+    if run_dir is None:
+        return model
+    payload = CheckpointManager(run_dir / "checkpoints").load(
+        best=checkpoint == "best",
+        map_location=runtime.device,
+    )
+    model.load_state_dict(payload["state"]["model_state_dict"])
+    model.eval()
+    return model
 
 
 def load_play_params(
@@ -57,17 +90,8 @@ def load_play_params(
     *,
     run_dir: Path | None = None,
     checkpoint: CheckpointSelector = "best",
-) -> Any:
-    game = create_game(config.game.name)
-    network = create_network(config.model, num_actions=game.num_actions)
-    if run_dir is None:
-        return network.init(
-            jax.random.PRNGKey(config.run.seed),
-            game.observation_shape,
-            game.num_actions,
-        )
-    payload = CheckpointManager(run_dir / "checkpoints").load(best=checkpoint == "best")
-    return payload["state"]["params"]
+) -> torch.nn.Module:
+    return load_play_model(config, run_dir=run_dir, checkpoint=checkpoint)
 
 
 def select_agent_action(
@@ -77,7 +101,7 @@ def select_agent_action(
     state: Any,
     seed: int,
 ) -> int:
-    return AgentPlayer(config, params=params).select_action(state, seed=seed)
+    return AgentPlayer(config, model=params).select_action(state, seed=seed)
 
 
 def result_message(game: Any, state: Any, *, human_player: int) -> str:
@@ -107,9 +131,9 @@ def play_scripted_game(
     human_player: int = 0,
 ) -> PlayResult:
     game = create_game(config.game.name)
-    params = load_play_params(config, run_dir=run_dir, checkpoint=checkpoint)
-    agent = AgentPlayer(config, params=params)
-    state = game.init(jax.random.PRNGKey(config.run.seed))
+    model = load_play_model(config, run_dir=run_dir, checkpoint=checkpoint)
+    agent = AgentPlayer(config, model=model)
+    state = game.init(config.run.seed)
     moves: list[int] = []
     human_index = 0
 

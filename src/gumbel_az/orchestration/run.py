@@ -69,9 +69,13 @@ class RunOrchestrator:
 
         if worker is None and self.runtime_backend.name == "torch":
             replay_writer = ReplayWriter(self.paths.run_dir / "replay")
-            from gumbel_az.selfplay.torch_fallback import TorchFallbackSelfPlayWorker
+            from gumbel_az.selfplay.worker import SelfPlayWorker
 
-            worker = TorchFallbackSelfPlayWorker(self.config, replay_writer=replay_writer)
+            worker = SelfPlayWorker(
+                self.config,
+                replay_writer=replay_writer,
+                device=self.runtime_backend.device,
+            )
         elif worker is None:
             raise RuntimeError(self.runtime_backend.reason)
         seed = self.config.run.seed + iteration * self.config.selfplay.games_per_iteration
@@ -94,7 +98,7 @@ class RunOrchestrator:
                 "illegal_action_rate": result.illegal_action_rate,
                 "policy_entropy_mean": result.policy_entropy_mean,
                 "root_value_mean": result.root_value_mean,
-                "runtime_backend_is_torch_fallback": self.runtime_backend.name == "torch",
+                "runtime_backend_is_torch": self.runtime_backend.name == "torch",
             },
         )
         return result
@@ -117,8 +121,8 @@ class RunOrchestrator:
                     "event": "runtime_backend_selected",
                     "runtime_backend": self.runtime_backend.name,
                     "reason": self.runtime_backend.reason,
-                    "jax_available": self.runtime_backend.jax_available,
                     "torch_available": self.runtime_backend.torch_available,
+                    "device": self.runtime_backend.device,
                 }
             )
             max_iterations = self.config.stop.max_iterations or 1
@@ -129,28 +133,8 @@ class RunOrchestrator:
             latest_eval_payload: dict[str, Any] | None = None
             iterations_completed = 0
 
-            if self.runtime_backend.name != "jax":
-                games_to_generate = min(
-                    self.config.stop.max_games or self.config.selfplay.games_per_iteration,
-                    self.config.selfplay.games_per_iteration,
-                )
-                selfplay_result = self._run_selfplay(
-                    iteration=0,
-                    games_to_generate=games_to_generate,
-                )
-                self._write_state(
-                    status="completed_torch_fallback",
-                    train_step=0,
-                    games_seen=selfplay_result.games,
-                    samples_seen=selfplay_result.positions,
-                    replay_shard=selfplay_result.replay_shard,
-                    note="JAX unavailable; PyTorch fallback generated replay only.",
-                )
-                return ExecutionResult(
-                    run_id=self.paths.run_id,
-                    run_dir=self.paths.run_dir,
-                    status="completed_torch_fallback",
-                )
+            if self.runtime_backend.name != "torch":
+                raise RuntimeError(self.runtime_backend.reason)
 
             from gumbel_az.eval import Arena, should_promote
             from gumbel_az.model.checkpoint import CheckpointManager
@@ -171,7 +155,8 @@ class RunOrchestrator:
             selfplay_worker = SelfPlayWorker(
                 self.config,
                 replay_writer=ReplayWriter(self.paths.run_dir / "replay"),
-                params=trainer.state.params,
+                model=trainer.state.model,
+                device=self.runtime_backend.device,
             )
 
             for iteration in range(max_iterations):
@@ -211,7 +196,7 @@ class RunOrchestrator:
                         remaining_games or self.config.selfplay.games_per_iteration,
                         self.config.selfplay.games_per_iteration,
                     )
-                    selfplay_worker.params = trainer.state.params
+                    selfplay_worker.model = trainer.state.model
                     selfplay_result = self._run_selfplay(
                         iteration=iteration,
                         games_to_generate=games_to_generate,
@@ -278,7 +263,7 @@ class RunOrchestrator:
                         event_writer=self.event_writer,
                     )
                     eval_result = arena.evaluate_vs_random(
-                        params=latest_train_result.state.params,
+                        model=latest_train_result.state.model,
                         checkpoint_version=latest_train_result.checkpoint_version,
                     )
                     is_first_best = not checkpoint_manager.best_path.exists()

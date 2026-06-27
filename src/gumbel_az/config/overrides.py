@@ -15,7 +15,10 @@ def parse_override(override: str) -> tuple[list[str], Any]:
     parts = [part for part in key.split(".") if part]
     if not parts:
         raise ValueError(f"override key is empty: {override}")
-    value = yaml.safe_load(raw_value)
+    if parts == ["training", "compile"]:
+        value = raw_value
+    else:
+        value = yaml.safe_load(raw_value)
     return parts, value
 
 

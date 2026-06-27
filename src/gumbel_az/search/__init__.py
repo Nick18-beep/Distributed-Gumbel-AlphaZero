@@ -1,7 +1,7 @@
 """Search backends."""
 
 from gumbel_az.search.backend import SearchBackend
-from gumbel_az.search.mctx_backend import MctxSearchBackend
 from gumbel_az.search.outputs import SearchOutput
+from gumbel_az.search.torch_gumbel_backend import TorchGumbelSearchBackend
 
-__all__ = ["MctxSearchBackend", "SearchBackend", "SearchOutput"]
+__all__ = ["SearchBackend", "SearchOutput", "TorchGumbelSearchBackend"]

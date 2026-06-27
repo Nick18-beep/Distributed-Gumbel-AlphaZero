@@ -1,12 +1,13 @@
-"""Common model output types."""
+"""Common PyTorch model outputs."""
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from dataclasses import dataclass
 
-import jax
+import torch
 
 
-class NetworkOutput(NamedTuple):
-    policy_logits: jax.Array
-    value: jax.Array
+@dataclass(frozen=True)
+class NetworkOutput:
+    policy_logits: torch.Tensor
+    value: torch.Tensor

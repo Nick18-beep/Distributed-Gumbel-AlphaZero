@@ -1,14 +1,14 @@
-"""Single-process trainer."""
+"""PyTorch trainer."""
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
 
-import jax
-import jax.numpy as jnp
 import numpy as np
+import torch
 
 from gumbel_az.config.schema import AppConfig
 from gumbel_az.envs import create_game
@@ -18,12 +18,13 @@ from gumbel_az.model.checkpoint import CheckpointManager
 from gumbel_az.model.optimizer import create_optimizer
 from gumbel_az.replay.reader import ReplayReader
 from gumbel_az.replay.sampler import ReplaySampler
-from gumbel_az.training.train_state import GAZTrainState, create_train_state, train_step
+from gumbel_az.runtime import detect_torch_runtime
+from gumbel_az.training.train_state import TorchTrainState, train_step
 
 
 @dataclass(frozen=True)
 class TrainLoopResult:
-    state: GAZTrainState
+    state: TorchTrainState
     checkpoint_version: int
     steps: int
     samples_seen: int
@@ -51,6 +52,44 @@ def _sample_age_seconds(samples: list[dict]) -> float:
     return float(np.mean(ages)) if ages else 0.0
 
 
+def _checkpoint_model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    original = getattr(model, "_orig_mod", None)
+    if isinstance(original, torch.nn.Module):
+        return original.state_dict()
+    return model.state_dict()
+
+
+def _maybe_compile_model(
+    model: torch.nn.Module,
+    *,
+    compile_policy: str,
+    device: torch.device,
+    run_name: str,
+) -> tuple[torch.nn.Module, str]:
+    if compile_policy == "off":
+        return model, "eager"
+    if not hasattr(torch, "compile"):
+        return model, "fallback"
+    should_compile = compile_policy == "on"
+    if compile_policy == "auto":
+        is_debug_run = "debug" in run_name.lower()
+        should_compile = device.type == "cuda" and not is_debug_run and sys.platform != "darwin"
+    if not should_compile:
+        return model, "eager"
+    try:
+        compiled = torch.compile(model, mode="reduce-overhead")
+    except Exception:
+        return model, "fallback"
+    if isinstance(compiled, torch.nn.Module):
+        return compiled, "compiled"
+    return model, "fallback"
+
+
+def _compiled_original_model(model: torch.nn.Module) -> torch.nn.Module | None:
+    original = getattr(model, "_orig_mod", None)
+    return original if isinstance(original, torch.nn.Module) else None
+
+
 class Trainer:
     def __init__(
         self,
@@ -59,32 +98,85 @@ class Trainer:
         replay_reader: ReplayReader,
         checkpoint_manager: CheckpointManager,
         metric_writer: MetricWriter | None = None,
+        device: torch.device | str | None = None,
     ) -> None:
         self.config = config
+        runtime = detect_torch_runtime()
+        self.device = torch.device(device or runtime.device)
         self.game = create_game(config.game.name)
         self.network = create_network(config.model, num_actions=self.game.num_actions)
         self.replay_reader = replay_reader
         self.replay_sampler = ReplaySampler(replay_reader, config.replay.window_samples)
         self.checkpoint_manager = checkpoint_manager
         self.metric_writer = metric_writer
-        self.tx, self.schedule = create_optimizer(config.training)
-        params = self.network.init(
-            jax.random.PRNGKey(config.run.seed),
+        self.model = self.network.init(
+            config.run.seed,
             self.game.observation_shape,
             self.game.num_actions,
+            device=self.device,
         )
-        self.state = create_train_state(params=params, apply_fn=self.network.apply, tx=self.tx)
+        self.model, compile_mode = _maybe_compile_model(
+            self.model,
+            compile_policy=config.training.compile,
+            device=self.device,
+            run_name=config.run.name,
+        )
+        self.optimizer, self.schedule = create_optimizer(self.model, config.training)
+        scaler = torch.amp.GradScaler("cuda") if self.device.type == "cuda" else None
+        self.state = TorchTrainState(
+            model=self.model,
+            optimizer=self.optimizer,
+            schedule=self.schedule,
+            step=0,
+            device=self.device,
+            scaler=scaler,
+            compile_enabled=compile_mode == "compiled",
+            compile_mode=compile_mode,
+        )
 
-    def _save_checkpoint(self, state: GAZTrainState) -> int:
+    def _fallback_state_to_eager(self, state: TorchTrainState) -> TorchTrainState:
+        original = _compiled_original_model(state.model)
+        if original is None:
+            return state
+        optimizer_state = state.optimizer.state_dict()
+        scaler_state = None if state.scaler is None else state.scaler.state_dict()
+        optimizer, schedule = create_optimizer(original, self.config.training)
+        try:
+            optimizer.load_state_dict(optimizer_state)
+        except ValueError:
+            pass
+        scaler = torch.amp.GradScaler("cuda") if state.device.type == "cuda" else None
+        if scaler is not None and scaler_state is not None:
+            scaler.load_state_dict(scaler_state)
+        return TorchTrainState(
+            model=original,
+            optimizer=optimizer,
+            schedule=schedule,
+            step=state.step,
+            device=state.device,
+            scaler=scaler,
+            compile_enabled=False,
+            compile_mode="fallback",
+        )
+
+    def _save_checkpoint(self, state: TorchTrainState) -> int:
         checkpoint_version = int(state.step)
         self.checkpoint_manager.save(
             version=checkpoint_version,
-            state={"params": state.params, "opt_state": state.opt_state, "step": state.step},
+            state={
+                "model_state_dict": _checkpoint_model_state_dict(state.model),
+                "optimizer_state_dict": state.optimizer.state_dict(),
+                "step": state.step,
+                "scaler_state_dict": None if state.scaler is None else state.scaler.state_dict(),
+            },
             metadata={
                 "training_step": checkpoint_version,
                 "game": self.game.name,
                 "algorithm": self.config.algorithm.name,
                 "model": self.config.model.name,
+                "runtime": "torch",
+                "device": str(self.device),
+                "compile_mode": state.compile_mode,
             },
         )
         return checkpoint_version
@@ -96,31 +188,37 @@ class Trainer:
             augmented.extend(self.game.symmetries(sample))
         return augmented
 
-    def _sample_batch(self, arrays: dict[str, np.ndarray], step: int) -> dict[str, jax.Array]:
-        batch_size = self.config.training.batch_size
-        return self.replay_sampler.sample_arrays(
-            arrays,
-            batch_size=batch_size,
+    def _sample_batch(self, tensors: dict[str, torch.Tensor], step: int) -> dict[str, torch.Tensor]:
+        return self.replay_sampler.sample_tensors(
+            tensors,
+            batch_size=self.config.training.batch_size,
             seed=self.config.run.seed + step,
             replace_if_needed=True,
+            device=self.device,
         )
 
     def run(self, *, max_steps: int | None = None) -> TrainLoopResult:
         steps = max_steps or self.config.training.steps_per_iteration
         samples = self._augmented_samples()
         sample_arrays = self.replay_sampler.arrays_from(samples)
+        sample_tensors = self.replay_sampler.tensors_from_arrays(
+            sample_arrays,
+            pin_memory=self.device.type == "cuda",
+        )
         replay_age = _sample_age_seconds(samples)
         start = perf_counter()
         latest_metrics: dict[str, float] = {}
         state = self.state
         for _ in range(steps):
-            batch = self._sample_batch(sample_arrays, int(state.step))
-            learning_rate = self.schedule(state.step)
-            state, metrics = train_step(state, batch, learning_rate)
-            latest_metrics = {
-                key: float(value) if hasattr(value, "item") else float(value)
-                for key, value in metrics.items()
-            }
+            batch = self._sample_batch(sample_tensors, int(state.step))
+            try:
+                state, latest_metrics = train_step(state, batch, self.config.training)
+            except Exception:
+                if not state.compile_enabled:
+                    raise
+                state = self._fallback_state_to_eager(state)
+                batch = self._sample_batch(sample_tensors, int(state.step))
+                state, latest_metrics = train_step(state, batch, self.config.training)
             if self.metric_writer is not None:
                 self.metric_writer.write_metrics(
                     int(state.step),
@@ -131,6 +229,7 @@ class Trainer:
                         "learning_rate": latest_metrics["learning_rate"],
                         "grad_norm": latest_metrics["grad_norm"],
                         "replay_sample_age_mean": replay_age,
+                        "compile_mode": state.compile_mode,
                     },
                 )
             if int(state.step) % self.config.training.checkpoint_every_steps == 0:
@@ -151,12 +250,18 @@ class Trainer:
         )
 
 
-def greedy_action_from_params(
-    network,
-    params: dict,
-    observation: jax.Array,
-    legal: jax.Array,
+def greedy_action_from_model(
+    model: torch.nn.Module,
+    observation: np.ndarray,
+    legal: np.ndarray,
+    *,
+    device: torch.device | str = "cpu",
 ) -> int:
-    output = network.apply(params, observation[None, ...], train=False)
-    logits = jnp.where(legal, output.policy_logits[0], -jnp.inf)
-    return int(jnp.argmax(logits))
+    model.eval()
+    device = torch.device(device)
+    with torch.inference_mode():
+        obs = torch.as_tensor(observation[None, ...], dtype=torch.float32, device=device)
+        output = model(obs)
+        logits = output.policy_logits[0].detach().cpu().numpy()
+    masked = np.where(np.asarray(legal, dtype=bool), logits, -np.inf)
+    return int(np.argmax(masked))

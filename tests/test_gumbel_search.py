@@ -1,73 +1,52 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
-import mctx
+import torch
 
 from gumbel_az.config import load_config
 from gumbel_az.envs.custom.connect_four import COLUMNS, ConnectFourGame
 from gumbel_az.model.common import NetworkOutput
 from gumbel_az.search.masking import masked_policy
-from gumbel_az.search.mctx_backend import MctxSearchBackend
+from gumbel_az.search.torch_gumbel_backend import TorchGumbelSearchBackend
 
 PROJECT_ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
 CONFIG = PROJECT_ROOT / "configs" / "connect_four_cpu_debug.yaml"
 
 
-def _batched_state(game: ConnectFourGame, batch_size: int):
-    state = game.init()
-    return jax.tree.map(lambda value: jnp.repeat(value[None, ...], batch_size, axis=0), state)
+def _network_apply(observation):
+    batch_size = observation.shape[0]
+    logits = torch.arange(COLUMNS, dtype=torch.float32, device=observation.device)
+    return NetworkOutput(
+        policy_logits=logits[None, :].repeat(batch_size, 1),
+        value=torch.zeros((batch_size,), dtype=torch.float32, device=observation.device),
+    )
 
 
-def test_mctx_search_smoke_connect_four_masks_illegal_actions_and_is_deterministic() -> None:
+def test_torch_gumbel_search_masks_illegal_actions_and_is_deterministic() -> None:
     config = load_config(CONFIG)
     game = ConnectFourGame()
-    state = _batched_state(game, 2)
-    observations = jax.vmap(game.canonical_observation)(state)
-    legal_mask = jax.vmap(game.legal_action_mask)(state)
-    legal_mask = legal_mask.at[:, -1].set(False)
+    state = game.init()
+    observations = torch.as_tensor(game.canonical_observation(state)[None, ...]).repeat(2, 1, 1, 1)
+    legal_mask = torch.as_tensor(game.legal_action_mask(state)[None, ...]).repeat(2, 1)
+    legal_mask[:, -1] = False
+    backend = TorchGumbelSearchBackend(game=game)
+    generator_a = torch.Generator().manual_seed(0)
+    generator_b = torch.Generator().manual_seed(0)
 
-    def network_apply(observation):
-        batch_size = observation.shape[0]
-        logits = jnp.arange(COLUMNS, dtype=jnp.float32)
-        return NetworkOutput(
-            policy_logits=jnp.repeat(logits[None, :], batch_size, axis=0),
-            value=jnp.zeros((batch_size,), dtype=jnp.float32),
-        )
-
-    def recurrent_fn(params, rng_key, action, embedding):
-        del params, rng_key
-        next_state = jax.vmap(game.step)(embedding, action)
-        next_obs = jax.vmap(game.canonical_observation)(next_state)
-        output = network_apply(next_obs)
-        return (
-            mctx.RecurrentFnOutput(
-                reward=jnp.zeros(action.shape, dtype=jnp.float32),
-                discount=jnp.where(jax.vmap(game.is_terminal)(next_state), 0.0, 1.0),
-                prior_logits=output.policy_logits,
-                value=output.value,
-            ),
-            next_state,
-        )
-
-    backend = MctxSearchBackend()
     output_a = backend.search(
         root_observation=observations,
         root_legal_mask=legal_mask,
-        network_apply=network_apply,
-        recurrent_fn=recurrent_fn,
-        rng_key=jax.random.PRNGKey(0),
+        network_apply=_network_apply,
+        rng=generator_a,
         config=config.search,
-        root_embedding=state,
+        root_embedding=[state, state],
     )
     output_b = backend.search(
         root_observation=observations,
         root_legal_mask=legal_mask,
-        network_apply=network_apply,
-        recurrent_fn=recurrent_fn,
-        rng_key=jax.random.PRNGKey(0),
+        network_apply=_network_apply,
+        rng=generator_b,
         config=config.search,
-        root_embedding=state,
+        root_embedding=[state, state],
     )
 
     assert output_a.policy_target.shape == (2, COLUMNS)
@@ -75,87 +54,30 @@ def test_mctx_search_smoke_connect_four_masks_illegal_actions_and_is_determinist
     assert output_a.q_values.shape == (2, COLUMNS)
     assert output_a.prior_logits.shape == (2, COLUMNS)
     assert output_a.policy_target[:, -1].tolist() == [0.0, 0.0]
-    assert jnp.allclose(jnp.sum(output_a.policy_target, axis=-1), 1.0)
-    assert jnp.array_equal(output_a.selected_action, output_b.selected_action)
-    assert jnp.allclose(output_a.policy_target, output_b.policy_target)
-
-
-def test_mctx_search_output_is_jittable() -> None:
-    config = load_config(CONFIG)
-    game = ConnectFourGame()
-    state = _batched_state(game, 1)
-    observations = jax.vmap(game.canonical_observation)(state)
-    legal_mask = jax.vmap(game.legal_action_mask)(state)
-
-    def network_apply(observation):
-        return NetworkOutput(
-            policy_logits=jnp.zeros((observation.shape[0], COLUMNS), dtype=jnp.float32),
-            value=jnp.zeros((observation.shape[0],), dtype=jnp.float32),
-        )
-
-    def recurrent_fn(params, rng_key, action, embedding):
-        del params, rng_key
-        next_state = jax.vmap(game.step)(embedding, action)
-        output = network_apply(jax.vmap(game.canonical_observation)(next_state))
-        return (
-            mctx.RecurrentFnOutput(
-                reward=jnp.zeros(action.shape, dtype=jnp.float32),
-                discount=jnp.where(jax.vmap(game.is_terminal)(next_state), 0.0, 1.0),
-                prior_logits=output.policy_logits,
-                value=output.value,
-            ),
-            next_state,
-        )
-
-    backend = MctxSearchBackend()
-
-    @jax.jit
-    def run_search(key):
-        return backend.search(
-            root_observation=observations,
-            root_legal_mask=legal_mask,
-            network_apply=network_apply,
-            recurrent_fn=recurrent_fn,
-            rng_key=key,
-            config=config.search,
-            root_embedding=state,
-        )
-
-    output = run_search(jax.random.PRNGKey(0))
-
-    assert output.policy_target.shape == (1, COLUMNS)
-    assert int(output.search_metadata["num_simulations"]) == config.search.simulations_per_move
+    assert torch.allclose(output_a.policy_target.sum(dim=-1), torch.ones(2))
+    assert torch.equal(output_a.selected_action, output_b.selected_action)
+    assert torch.allclose(output_a.policy_target, output_b.policy_target)
 
 
 def test_masked_policy_assigns_zero_to_illegal_actions() -> None:
-    logits = jnp.asarray([[1.0, 2.0, 3.0]])
-    legal = jnp.asarray([[True, False, True]])
+    logits = torch.asarray([[1.0, 2.0, 3.0]])
+    legal = torch.asarray([[True, False, True]])
     probs = masked_policy(logits, legal)
 
     assert probs[0, 1] == 0.0
-    assert jnp.isclose(jnp.sum(probs), 1.0)
+    assert torch.isclose(probs.sum(), torch.tensor(1.0))
 
 
-def test_mctx_search_rejects_shape_mismatch() -> None:
+def test_torch_gumbel_search_rejects_shape_mismatch() -> None:
     config = load_config(CONFIG)
-    backend = MctxSearchBackend()
-
-    def network_apply(observation):
-        return NetworkOutput(
-            policy_logits=jnp.zeros((observation.shape[0], COLUMNS), dtype=jnp.float32),
-            value=jnp.zeros((observation.shape[0],), dtype=jnp.float32),
-        )
-
-    def recurrent_fn(params, rng_key, action, embedding):
-        raise AssertionError("recurrent_fn should not be called")
+    backend = TorchGumbelSearchBackend()
 
     try:
         backend.search(
-            root_observation=jnp.zeros((1, 6, 7, 2), dtype=jnp.float32),
-            root_legal_mask=jnp.ones((1, COLUMNS + 1), dtype=bool),
-            network_apply=network_apply,
-            recurrent_fn=recurrent_fn,
-            rng_key=jax.random.PRNGKey(0),
+            root_observation=torch.zeros((1, 6, 7, 2), dtype=torch.float32),
+            root_legal_mask=torch.ones((1, COLUMNS + 1), dtype=torch.bool),
+            network_apply=_network_apply,
+            rng=torch.Generator().manual_seed(0),
             config=config.search,
         )
     except ValueError as exc:
@@ -164,57 +86,103 @@ def test_mctx_search_rejects_shape_mismatch() -> None:
         raise AssertionError("expected shape mismatch to fail")
 
 
-def test_mctx_search_rejects_non_bool_legal_mask() -> None:
+def test_torch_gumbel_search_rejects_roots_without_legal_actions() -> None:
     config = load_config(CONFIG)
-    backend = MctxSearchBackend()
-
-    def network_apply(observation):
-        return NetworkOutput(
-            policy_logits=jnp.zeros((observation.shape[0], COLUMNS), dtype=jnp.float32),
-            value=jnp.zeros((observation.shape[0],), dtype=jnp.float32),
-        )
-
-    def recurrent_fn(params, rng_key, action, embedding):
-        raise AssertionError("recurrent_fn should not be called")
+    backend = TorchGumbelSearchBackend()
 
     try:
         backend.search(
-            root_observation=jnp.zeros((1, 6, 7, 2), dtype=jnp.float32),
-            root_legal_mask=jnp.ones((1, COLUMNS), dtype=jnp.int32),
-            network_apply=network_apply,
-            recurrent_fn=recurrent_fn,
-            rng_key=jax.random.PRNGKey(0),
-            config=config.search,
-        )
-    except TypeError as exc:
-        assert "bool" in str(exc)
-    else:
-        raise AssertionError("expected non-bool mask to fail")
-
-
-def test_mctx_search_rejects_roots_without_legal_actions() -> None:
-    config = load_config(CONFIG)
-    backend = MctxSearchBackend()
-
-    def network_apply(observation):
-        return NetworkOutput(
-            policy_logits=jnp.zeros((observation.shape[0], COLUMNS), dtype=jnp.float32),
-            value=jnp.zeros((observation.shape[0],), dtype=jnp.float32),
-        )
-
-    def recurrent_fn(params, rng_key, action, embedding):
-        raise AssertionError("recurrent_fn should not be called")
-
-    try:
-        backend.search(
-            root_observation=jnp.zeros((1, 6, 7, 2), dtype=jnp.float32),
-            root_legal_mask=jnp.zeros((1, COLUMNS), dtype=bool),
-            network_apply=network_apply,
-            recurrent_fn=recurrent_fn,
-            rng_key=jax.random.PRNGKey(0),
+            root_observation=torch.zeros((1, 6, 7, 2), dtype=torch.float32),
+            root_legal_mask=torch.zeros((1, COLUMNS), dtype=torch.bool),
+            network_apply=_network_apply,
+            rng=torch.Generator().manual_seed(0),
             config=config.search,
         )
     except ValueError as exc:
         assert "legal action" in str(exc)
     else:
         raise AssertionError("expected all-illegal root to fail")
+
+
+def test_torch_gumbel_search_visit_counts_do_not_mark_illegal_padding() -> None:
+    config = load_config(CONFIG, ["search.max_num_considered_actions=7"])
+    backend = TorchGumbelSearchBackend()
+    legal_mask = torch.asarray([[False, False, True, False, False, False, False]])
+
+    output = backend.search(
+        root_observation=torch.zeros((1, 6, 7, 2), dtype=torch.float32),
+        root_legal_mask=legal_mask,
+        network_apply=_network_apply,
+        rng=torch.Generator().manual_seed(0),
+        config=config.search,
+    )
+
+    assert output.selected_action.tolist() == [2]
+    assert output.policy_target[0, 2] == 1.0
+    assert torch.count_nonzero(output.policy_target[~legal_mask]) == 0
+    assert torch.count_nonzero(output.visit_counts[~legal_mask]) == 0
+
+
+def test_torch_gumbel_search_rejects_root_embedding_batch_mismatch() -> None:
+    config = load_config(CONFIG)
+    game = ConnectFourGame()
+    state = game.init()
+    observations = torch.as_tensor(game.canonical_observation(state)[None, ...]).repeat(2, 1, 1, 1)
+    legal_mask = torch.as_tensor(game.legal_action_mask(state)[None, ...]).repeat(2, 1)
+    backend = TorchGumbelSearchBackend(game=game)
+
+    try:
+        backend.search(
+            root_observation=observations,
+            root_legal_mask=legal_mask,
+            network_apply=_network_apply,
+            rng=torch.Generator().manual_seed(0),
+            config=config.search,
+            root_embedding=state,
+        )
+    except ValueError as exc:
+        assert "root_embedding batch size" in str(exc)
+    else:
+        raise AssertionError("expected root embedding batch mismatch to fail")
+
+
+def test_torch_gumbel_search_accepts_tuple_root_embedding_batch() -> None:
+    config = load_config(CONFIG)
+    game = ConnectFourGame()
+    state = game.init()
+    observations = torch.as_tensor(game.canonical_observation(state)[None, ...]).repeat(2, 1, 1, 1)
+    legal_mask = torch.as_tensor(game.legal_action_mask(state)[None, ...]).repeat(2, 1)
+    backend = TorchGumbelSearchBackend(game=game)
+
+    output = backend.search(
+        root_observation=observations,
+        root_legal_mask=legal_mask,
+        network_apply=_network_apply,
+        rng=torch.Generator().manual_seed(0),
+        config=config.search,
+        root_embedding=(state, state),
+    )
+
+    assert output.policy_target.shape == (2, COLUMNS)
+
+
+def test_torch_gumbel_search_uses_terminal_child_reward_for_q_value() -> None:
+    config = load_config(CONFIG)
+    game = ConnectFourGame()
+    state = game.init()
+    for action in [0, 1, 0, 1, 0, 1]:
+        state = game.step(state, action)
+    legal_mask = torch.as_tensor(game.legal_action_mask(state)[None, ...])
+    observation = torch.as_tensor(game.canonical_observation(state)[None, ...])
+    backend = TorchGumbelSearchBackend(game=game)
+
+    output = backend.search(
+        root_observation=observation,
+        root_legal_mask=legal_mask,
+        network_apply=_network_apply,
+        rng=torch.Generator().manual_seed(0),
+        config=config.search,
+        root_embedding=[state],
+    )
+
+    assert output.q_values[0, 0] == 1.0

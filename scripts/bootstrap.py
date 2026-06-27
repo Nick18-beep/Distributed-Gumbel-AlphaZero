@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VALID_PROFILES = ("cpu", "cuda", "cuda12", "dev", "distributed", "analysis")
+VALID_PROFILES = ("cpu", "cuda", "dev", "distributed", "analysis")
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,6 +106,8 @@ def install_uv() -> None:
 def ensure_python_version() -> None:
     if sys.version_info < (3, 11):  # noqa: UP036 - bootstrap can run before packaging metadata.
         raise SystemExit("Python 3.11+ is required.")
+    if sys.version_info >= (3, 14):
+        raise SystemExit("Python 3.14 is not supported yet; use Python 3.11, 3.12, or 3.13.")
 
 
 def ensure_artifact_dirs() -> None:

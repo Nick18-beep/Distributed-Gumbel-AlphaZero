@@ -1,51 +1,67 @@
-"""Small MLP network for CPU tests and debug runs."""
+"""PyTorch MLP policy/value model."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
+import torch
+from torch import nn
 
 from gumbel_az.model.common import NetworkOutput
 
 
-class MLPModule(nn.Module):
-    hidden_size: int
-    num_actions: int
+class MLPPolicyValue(nn.Module):
+    def __init__(
+        self,
+        *,
+        observation_shape: tuple[int, ...],
+        hidden_size: int,
+        num_actions: int,
+    ) -> None:
+        super().__init__()
+        features = 1
+        for dim in observation_shape:
+            features *= dim
+        self.body = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(features, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+        )
+        self.policy_head = nn.Linear(hidden_size, num_actions)
+        self.value_head = nn.Linear(hidden_size, 1)
 
-    @nn.compact
-    def __call__(self, observations: jax.Array, train: bool = False) -> NetworkOutput:
-        del train
-        x = observations.reshape((observations.shape[0], -1))
-        x = nn.relu(nn.Dense(self.hidden_size)(x))
-        x = nn.relu(nn.Dense(self.hidden_size)(x))
-        policy_logits = nn.Dense(self.num_actions)(x)
-        value = nn.tanh(nn.Dense(1)(x)).squeeze(-1)
-        return NetworkOutput(policy_logits=policy_logits, value=value)
+    def forward(self, observations: torch.Tensor) -> NetworkOutput:
+        hidden = self.body(observations.float())
+        return NetworkOutput(
+            policy_logits=self.policy_head(hidden),
+            value=torch.tanh(self.value_head(hidden)).squeeze(-1),
+        )
 
 
-@dataclass(frozen=True)
 class MLPNetworkFactory:
-    hidden_size: int
-    num_actions: int
-    name: str = "mlp_small"
+    name = "mlp_small"
+
+    def __init__(self, *, hidden_size: int, num_actions: int) -> None:
+        self.hidden_size = hidden_size
+        self.num_actions = num_actions
+
+    def build(self, observation_shape: tuple[int, ...], num_actions: int) -> nn.Module:
+        if num_actions != self.num_actions:
+            raise ValueError(f"num_actions mismatch: {num_actions} != {self.num_actions}")
+        return MLPPolicyValue(
+            observation_shape=observation_shape,
+            hidden_size=self.hidden_size,
+            num_actions=num_actions,
+        )
 
     def init(
         self,
-        rng_key: jax.Array,
+        seed: int,
         observation_shape: tuple[int, ...],
         num_actions: int,
-    ) -> dict:
-        if num_actions != self.num_actions:
-            raise ValueError(
-                f"MLPNetworkFactory expected num_actions={self.num_actions}, got {num_actions}"
-            )
-        module = MLPModule(hidden_size=self.hidden_size, num_actions=self.num_actions)
-        dummy = jnp.zeros((1, *observation_shape), dtype=jnp.float32)
-        return module.init(rng_key, dummy, train=False)["params"]
-
-    def apply(self, params: dict, observations: jax.Array, train: bool = False) -> NetworkOutput:
-        module = MLPModule(hidden_size=self.hidden_size, num_actions=self.num_actions)
-        return module.apply({"params": params}, observations, train=train)
+        *,
+        device: torch.device | str = "cpu",
+    ) -> nn.Module:
+        torch.manual_seed(seed)
+        model = self.build(observation_shape, num_actions).to(device)
+        return model

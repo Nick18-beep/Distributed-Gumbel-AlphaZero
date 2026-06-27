@@ -1,21 +1,20 @@
-"""Self-play worker using Gumbel AlphaZero search."""
+"""PyTorch self-play worker using Gumbel AlphaZero search."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
 from uuid import uuid4
 
-import jax
 import numpy as np
+import torch
 
 from gumbel_az.algorithms import create_algorithm
 from gumbel_az.config.schema import AppConfig
 from gumbel_az.envs import create_game
 from gumbel_az.model import create_network
 from gumbel_az.replay import ReplayWriter
-from gumbel_az.search import MctxSearchBackend
+from gumbel_az.search import TorchGumbelSearchBackend
 from gumbel_az.selfplay.trajectory import Trajectory, TrajectoryStep
 
 
@@ -38,7 +37,7 @@ class SelfPlayResult:
         return self.positions / max(self.seconds, 1.0e-9)
 
 
-def _entropy(policy: jax.Array) -> float:
+def _entropy(policy: np.ndarray) -> float:
     probs = np.asarray(policy, dtype=np.float32)
     positive = probs[probs > 0.0]
     if positive.size == 0:
@@ -52,43 +51,46 @@ class SelfPlayWorker:
         config: AppConfig,
         *,
         replay_writer: ReplayWriter,
-        params: Any | None = None,
+        model: torch.nn.Module | None = None,
+        device: torch.device | str = "cpu",
     ) -> None:
         self.config = config
+        self.device = torch.device(device)
         self.game = create_game(config.game.name)
         self.network = create_network(config.model, num_actions=self.game.num_actions)
-        self.params = params
-        if self.params is None:
-            self.params = self.network.init(
-                jax.random.PRNGKey(config.run.seed),
+        self.model = model
+        if self.model is None:
+            self.model = self.network.init(
+                config.run.seed,
                 self.game.observation_shape,
                 self.game.num_actions,
+                device=self.device,
             )
+        self.model.to(self.device)
+        self.model.eval()
         self.algorithm = create_algorithm(
             config,
             game=self.game,
-            search_backend=MctxSearchBackend(),
+            search_backend=TorchGumbelSearchBackend(game=self.game, device=self.device),
         )
         self.replay_writer = replay_writer
         self.model_version = 0
-        self._select_fn = jax.jit(self._select_action)
 
-    def _network_apply(self, params: Any, observations: jax.Array):
-        return self.network.apply(params, observations, train=False)
+    def _network_apply(self, observations: torch.Tensor):
+        self.model.eval()
+        return self.model(observations.to(self.device, non_blocking=True))
 
-    def _select_action(self, params, state, rng_key, temperature):
-        def network_apply(observations: jax.Array):
-            return self._network_apply(params, observations)
+    def _make_generator(self, seed: int) -> torch.Generator:
+        try:
+            generator = torch.Generator(device=self.device)
+        except (RuntimeError, TypeError):
+            generator = torch.Generator()
+        generator.manual_seed(seed)
+        return generator
 
-        return self.algorithm.select_action(
-            game_state=state,
-            network_apply=network_apply,
-            rng_key=rng_key,
-            temperature=temperature,
-        )
-
-    def play_game(self, rng_key: jax.Array, *, game_id: str | None = None) -> Trajectory:
-        state = self.game.init(rng_key)
+    def play_game(self, seed: int, *, game_id: str | None = None) -> Trajectory:
+        generator = self._make_generator(seed)
+        state = self.game.init(seed)
         steps: list[TrajectoryStep] = []
         game_id = game_id or uuid4().hex
         illegal_actions = 0
@@ -96,52 +98,49 @@ class SelfPlayWorker:
         for move_index in range(self.game.max_moves):
             if bool(self.game.is_terminal(state)):
                 break
-            key, rng_key = jax.random.split(rng_key)
             observation = self.game.canonical_observation(state)
             legal_mask = self.game.legal_action_mask(state)
             to_play = int(self.game.current_player(state))
             temperature = self.algorithm.temperature_for_move(move_index)
-            output = self._select_fn(self.params, state, key, temperature)
-            (
-                selected_action,
-                root_value,
-                policy_target,
-                visit_counts,
-                observation_host,
-                legal_mask_host,
-            ) = jax.device_get(
-                (
-                    output.selected_action,
-                    output.root_value,
-                    output.policy_target,
-                    output.visit_counts,
-                    observation,
-                    legal_mask,
-                )
+            output = self.algorithm.select_action(
+                game_state=state,
+                network_apply=self._network_apply,
+                rng=generator,
+                temperature=temperature,
             )
-            action = int(selected_action)
-            if action < 0 or action >= self.game.num_actions or not bool(legal_mask_host[action]):
+            selected_action = int(output.selected_action.detach().cpu().item())
+            policy_target = output.policy_target.detach().cpu().numpy().astype(np.float32)
+            visit_counts = output.visit_counts.detach().cpu().numpy().astype(np.float32)
+            root_value = float(output.root_value.detach().cpu().item())
+            if (
+                selected_action < 0
+                or selected_action >= self.game.num_actions
+                or not bool(legal_mask[selected_action])
+            ):
                 illegal_actions += 1
-                raise ValueError(f"search selected illegal action {action} at move {move_index}")
+                raise ValueError(
+                    f"search selected illegal action {selected_action} at move {move_index}"
+                )
 
             steps.append(
                 TrajectoryStep(
-                    observation=observation_host,
-                    legal_action_mask=legal_mask_host,
+                    observation=np.asarray(observation, dtype=np.float32),
+                    legal_action_mask=np.asarray(legal_mask, dtype=bool),
                     policy_target=policy_target,
-                    action=action,
-                    root_value=float(root_value),
+                    action=selected_action,
+                    root_value=root_value,
                     to_play=to_play,
                     move_index=move_index,
                     search_stats={
-                        "selected_action": action,
-                        "root_value": float(root_value),
+                        "backend": "torch_gumbel",
+                        "selected_action": selected_action,
+                        "root_value": root_value,
                         "policy_entropy": _entropy(policy_target),
-                        "visit_counts": np.asarray(visit_counts).tolist(),
+                        "visit_counts": visit_counts.tolist(),
                     },
                 )
             )
-            state = self.game.step(state, action)
+            state = self.game.step(state, selected_action)
 
         final_rewards = self.game.rewards(state)
         if illegal_actions:
@@ -164,7 +163,7 @@ class SelfPlayWorker:
         entropies = []
         root_values = []
         for index in range(num_games):
-            trajectory = self.play_game(jax.random.PRNGKey(seed + index))
+            trajectory = self.play_game(seed + index)
             trajectories.append(trajectory)
             samples.extend(self.algorithm.generate_targets(trajectory, trajectory.final_rewards))
             entropies.extend(step.search_stats["policy_entropy"] for step in trajectory.steps)

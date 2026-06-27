@@ -1,75 +1,98 @@
-"""Small residual board network."""
+"""PyTorch residual board policy/value model."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
+import torch
+from torch import nn
 
 from gumbel_az.model.common import NetworkOutput
 
 
 class ResidualBlock(nn.Module):
-    channels: int
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.activation = nn.ReLU()
 
-    @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        residual = x
-        x = nn.relu(nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME")(x))
-        x = nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME")(x)
-        return nn.relu(x + residual)
-
-
-class ResNetBoardModule(nn.Module):
-    channels: int
-    blocks: int
-    num_actions: int
-
-    @nn.compact
-    def __call__(self, observations: jax.Array, train: bool = False) -> NetworkOutput:
-        del train
-        x = nn.relu(nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME")(observations))
-        for _ in range(self.blocks):
-            x = ResidualBlock(self.channels)(x)
-        flat = x.reshape((x.shape[0], -1))
-        policy_hidden = nn.relu(nn.Dense(self.channels)(flat))
-        value_hidden = nn.relu(nn.Dense(self.channels)(flat))
-        policy_logits = nn.Dense(self.num_actions)(policy_hidden)
-        value = nn.tanh(nn.Dense(1)(value_hidden)).squeeze(-1)
-        return NetworkOutput(policy_logits=policy_logits, value=value)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(x + self.net(x))
 
 
-@dataclass(frozen=True)
+class ResNetBoard(nn.Module):
+    def __init__(
+        self,
+        *,
+        observation_shape: tuple[int, ...],
+        channels: int,
+        blocks: int,
+        num_actions: int,
+    ) -> None:
+        super().__init__()
+        if len(observation_shape) != 3:
+            raise ValueError(f"resnet_board expects HWC observation, got {observation_shape}")
+        rows, columns, input_channels = observation_shape
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+        )
+        self.blocks = nn.Sequential(*(ResidualBlock(channels) for _ in range(blocks)))
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(channels, 2, kernel_size=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(2 * rows * columns, num_actions),
+        )
+        self.value_head = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(rows * columns, channels),
+            nn.ReLU(),
+            nn.Linear(channels, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, observations: torch.Tensor) -> NetworkOutput:
+        x = observations.float().permute(0, 3, 1, 2).contiguous()
+        hidden = self.blocks(self.stem(x))
+        return NetworkOutput(
+            policy_logits=self.policy_head(hidden),
+            value=self.value_head(hidden).squeeze(-1),
+        )
+
+
 class ResNetBoardFactory:
-    channels: int
-    blocks: int
-    num_actions: int
-    name: str = "resnet_board"
+    name = "resnet_board"
+
+    def __init__(self, *, channels: int, blocks: int, num_actions: int) -> None:
+        self.channels = channels
+        self.blocks = blocks
+        self.num_actions = num_actions
+
+    def build(self, observation_shape: tuple[int, ...], num_actions: int) -> nn.Module:
+        if num_actions != self.num_actions:
+            raise ValueError(f"num_actions mismatch: {num_actions} != {self.num_actions}")
+        return ResNetBoard(
+            observation_shape=observation_shape,
+            channels=self.channels,
+            blocks=self.blocks,
+            num_actions=num_actions,
+        )
 
     def init(
         self,
-        rng_key: jax.Array,
+        seed: int,
         observation_shape: tuple[int, ...],
         num_actions: int,
-    ) -> dict:
-        if num_actions != self.num_actions:
-            raise ValueError(
-                f"ResNetBoardFactory expected num_actions={self.num_actions}, got {num_actions}"
-            )
-        module = ResNetBoardModule(
-            channels=self.channels,
-            blocks=self.blocks,
-            num_actions=self.num_actions,
-        )
-        dummy = jnp.zeros((1, *observation_shape), dtype=jnp.float32)
-        return module.init(rng_key, dummy, train=False)["params"]
-
-    def apply(self, params: dict, observations: jax.Array, train: bool = False) -> NetworkOutput:
-        module = ResNetBoardModule(
-            channels=self.channels,
-            blocks=self.blocks,
-            num_actions=self.num_actions,
-        )
-        return module.apply({"params": params}, observations, train=train)
+        *,
+        device: torch.device | str = "cpu",
+    ) -> nn.Module:
+        torch.manual_seed(seed)
+        return self.build(observation_shape, num_actions).to(device)

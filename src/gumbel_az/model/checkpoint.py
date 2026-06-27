@@ -1,4 +1,4 @@
-"""Orbax-backed checkpoint registry."""
+"""Torch checkpoint registry."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import orbax.checkpoint as ocp
+import torch
 
 from gumbel_az.storage.atomic import atomic_write_json
 
@@ -33,7 +33,7 @@ def _entry_for_version(index_path: Path, version: int) -> dict[str, Any]:
 
 
 class CheckpointManager:
-    """Small registry around Orbax PyTree checkpoints."""
+    """Small registry around torch.save checkpoints."""
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -41,7 +41,6 @@ class CheckpointManager:
         self.index_path = self.root / "index.json"
         self.latest_path = self.root / "latest.json"
         self.best_path = self.root / "best.json"
-        self._checkpointer = ocp.PyTreeCheckpointer()
 
     def checkpoint_dir(self, version: int) -> Path:
         return self.root / f"ckpt_{version:06d}"
@@ -60,7 +59,7 @@ class CheckpointManager:
             raise FileExistsError(final_dir)
         if staging_dir.exists():
             shutil.rmtree(staging_dir)
-
+        staging_dir.mkdir(parents=True)
         payload = {
             "state": state,
             "metadata": {
@@ -70,7 +69,7 @@ class CheckpointManager:
             },
         }
         try:
-            self._checkpointer.save(staging_dir, payload)
+            torch.save(payload, staging_dir / "checkpoint.pt")
             staging_dir.replace(final_dir)
         except BaseException:
             if staging_dir.exists():
@@ -92,7 +91,13 @@ class CheckpointManager:
             atomic_write_json(self.best_path, entry)
         return final_dir
 
-    def load(self, version: int | None = None, *, best: bool = False) -> Any:
+    def load(
+        self,
+        version: int | None = None,
+        *,
+        best: bool = False,
+        map_location: str | torch.device = "cpu",
+    ) -> Any:
         if best:
             pointer = _load_json(self.best_path, None)
             if pointer is None:
@@ -105,10 +110,10 @@ class CheckpointManager:
             checkpoint_dir = Path(pointer["path"])
         else:
             checkpoint_dir = Path(_entry_for_version(self.index_path, version)["path"])
-
-        if not checkpoint_dir.exists():
-            raise FileNotFoundError(checkpoint_dir)
-        return self._checkpointer.restore(checkpoint_dir)
+        checkpoint_file = checkpoint_dir / "checkpoint.pt"
+        if not checkpoint_file.exists():
+            raise FileNotFoundError(checkpoint_file)
+        return torch.load(checkpoint_file, map_location=map_location, weights_only=False)
 
     def promote(self, version: int) -> None:
         entry = _entry_for_version(self.index_path, version)

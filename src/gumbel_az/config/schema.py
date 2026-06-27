@@ -34,7 +34,7 @@ class ClusterConfig(StrictBaseModel):
 
 
 class InstallConfig(StrictBaseModel):
-    profile: Literal["cpu", "cuda", "cuda12", "distributed", "analysis", "dev"]
+    profile: Literal["cpu", "cuda", "distributed", "analysis", "dev"]
 
 
 class StorageConfig(StrictBaseModel):
@@ -112,6 +112,7 @@ class TrainingConfig(StrictBaseModel):
     warmup_steps: int = Field(default=0, ge=0)
     gradient_clip_norm: PositiveFloat | None = 1.0
     checkpoint_every_steps: PositiveInt
+    compile: Literal["auto", "on", "off"] = "auto"
 
 
 class EvalConfig(StrictBaseModel):

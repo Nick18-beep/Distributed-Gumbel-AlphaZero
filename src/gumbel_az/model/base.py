@@ -1,24 +1,25 @@
-"""Network factory contract."""
+"""PyTorch network factory protocol."""
 
 from __future__ import annotations
 
 from typing import Protocol
 
-import jax
-
-from gumbel_az.model.common import NetworkOutput
+import torch
+from torch import nn
 
 
 class NetworkFactory(Protocol):
     name: str
 
+    def build(self, observation_shape: tuple[int, ...], num_actions: int) -> nn.Module:
+        """Create a PyTorch policy/value module."""
+
     def init(
         self,
-        rng_key: jax.Array,
+        seed: int,
         observation_shape: tuple[int, ...],
         num_actions: int,
-    ) -> dict:
-        """Initialize network parameters."""
-
-    def apply(self, params: dict, observations: jax.Array, train: bool = False) -> NetworkOutput:
-        """Apply network to a batch of observations."""
+        *,
+        device: torch.device | str = "cpu",
+    ) -> nn.Module:
+        """Create an initialized module on device."""

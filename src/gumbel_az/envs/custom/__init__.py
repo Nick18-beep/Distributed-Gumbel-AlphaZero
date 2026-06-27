@@ -1,4 +1,4 @@
-"""Custom JAX-friendly environments."""
+"""Custom environments."""
 
 from gumbel_az.envs.custom.connect_four import ConnectFourGame, ConnectFourState
 

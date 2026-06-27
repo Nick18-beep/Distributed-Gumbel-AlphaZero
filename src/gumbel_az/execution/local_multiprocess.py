@@ -11,16 +11,13 @@ from typing import Any
 
 from gumbel_az.config.loader import save_resolved_config
 from gumbel_az.config.schema import AppConfig
-from gumbel_az.eval import Arena, should_promote
 from gumbel_az.execution.base import ExecutionResult
 from gumbel_az.logging import JsonlWriter, MetricWriter
-from gumbel_az.model.checkpoint import CheckpointManager
-from gumbel_az.orchestration.scheduler import LocalScheduler, SchedulerSignals
-from gumbel_az.replay import ReplayReader, ReplayWriter
+from gumbel_az.orchestration.run import RunOrchestrator
+from gumbel_az.replay import ReplayWriter
 from gumbel_az.runtime import detect_runtime_backend
 from gumbel_az.storage import create_run_directory
 from gumbel_az.storage.atomic import atomic_write_json
-from gumbel_az.training.trainer import Trainer
 
 
 def _utc_now() -> str:
@@ -37,22 +34,22 @@ def _selfplay_process(
     try:
         config = AppConfig.model_validate(config_data)
         runtime = detect_runtime_backend()
-        replay_writer = ReplayWriter(Path(run_dir) / "replay")
-        if runtime.name == "jax":
-            from gumbel_az.selfplay.worker import SelfPlayWorker
-
-            worker = SelfPlayWorker(config, replay_writer=replay_writer)
-        elif runtime.name == "torch":
-            from gumbel_az.selfplay.torch_fallback import TorchFallbackSelfPlayWorker
-
-            worker = TorchFallbackSelfPlayWorker(config, replay_writer=replay_writer)
-        else:
+        if runtime.name != "torch":
             raise RuntimeError(runtime.reason)
+        from gumbel_az.selfplay.worker import SelfPlayWorker
+
+        replay_writer = ReplayWriter(Path(run_dir) / "replay")
+        worker = SelfPlayWorker(
+            config,
+            replay_writer=replay_writer,
+            device=runtime.device,
+        )
         _, result = worker.play_batch(games, seed)
         out.put(
             {
                 "ok": True,
                 "runtime_backend": runtime.name,
+                "device": runtime.device,
                 "games": result.games,
                 "positions": result.positions,
                 "replay_shard": result.replay_shard,
@@ -68,7 +65,7 @@ def _selfplay_process(
 
 
 class LocalMultiprocessExecutionBackend:
-    """Run self-play in a child process and training/evaluation in the parent."""
+    """Run one self-play batch in a child process, then train in the parent."""
 
     name = "local_multiprocess"
 
@@ -82,11 +79,14 @@ class LocalMultiprocessExecutionBackend:
         event_writer = JsonlWriter(paths.events_path)
         metric_writer = MetricWriter(paths.metrics_path)
         runtime = detect_runtime_backend()
+        if runtime.name != "torch":
+            raise RuntimeError(runtime.reason)
         state = {
             "run_id": paths.run_id,
             "backend": self.name,
             "runtime_backend": runtime.name,
             "runtime_backend_reason": runtime.reason,
+            "device": runtime.device,
             "status": "running",
             "created_at": _utc_now(),
             "config_path": str(paths.resolved_config_path),
@@ -129,13 +129,6 @@ class LocalMultiprocessExecutionBackend:
             state["status"] = "interrupted"
             state["worker_exitcode"] = process.exitcode
             atomic_write_json(paths.run_state_path, state)
-            event_writer.write(
-                {
-                    "event": "worker_process_timeout",
-                    "worker": process.name,
-                    "exitcode": process.exitcode,
-                }
-            )
             raise TimeoutError("local_multiprocess self-play worker timed out")
         try:
             message = result_queue.get(timeout=5.0)
@@ -143,13 +136,6 @@ class LocalMultiprocessExecutionBackend:
             state["status"] = "failed"
             state["worker_exitcode"] = process.exitcode
             atomic_write_json(paths.run_state_path, state)
-            event_writer.write(
-                {
-                    "event": "worker_process_missing_result",
-                    "worker": process.name,
-                    "exitcode": process.exitcode,
-                }
-            )
             raise RuntimeError(
                 f"self-play worker exited without result: {process.exitcode}"
             ) from exc
@@ -187,98 +173,32 @@ class LocalMultiprocessExecutionBackend:
                 "illegal_action_rate": message["illegal_action_rate"],
                 "policy_entropy_mean": message["policy_entropy_mean"],
                 "root_value_mean": message["root_value_mean"],
-                "selfplay_queue_depth": 0,
-                "replay_write_queue_depth": 0,
             },
         )
-
-        if runtime.name != "jax":
-            state.update(
-                {
-                    "status": "completed_torch_fallback",
-                    "runtime_backend": runtime.name,
-                    "worker_runtime_backend": message["runtime_backend"],
-                    "worker_exitcode": process.exitcode,
-                    "games_seen": message["games"],
-                    "samples_seen": message["positions"],
-                    "replay_shard": message["replay_shard"],
-                }
-            )
-            atomic_write_json(paths.run_state_path, state)
-            return ExecutionResult(paths.run_id, paths.run_dir, state["status"])
-
-        replay_reader = ReplayReader(paths.run_dir / "replay")
-        replay_samples_available = sum(
-            int(entry.get("samples", 0)) for entry in replay_reader.shard_paths_metadata()
-        )
-        decision = LocalScheduler(config).decide(
-            SchedulerSignals(
-                replay_samples_available=replay_samples_available,
-                selfplay_queue_depth=0,
-                replay_write_queue_depth=0,
-                evaluation_pending=config.eval.enabled,
-            )
-        )
-        event_writer.write(
-            {
-                "event": "scheduler_decision",
-                "stage": "local_multiprocess_training",
-                "decision": decision.to_event(),
-            }
-        )
-        checkpoint_manager = CheckpointManager(paths.run_dir / "checkpoints")
-        trainer = Trainer(
-            config,
-            replay_reader=replay_reader,
-            checkpoint_manager=checkpoint_manager,
-            metric_writer=metric_writer,
-        )
-        max_steps = min(
-            config.training.steps_per_iteration,
-            config.stop.max_train_steps or config.training.steps_per_iteration,
-        )
         try:
-            train_result = trainer.run(max_steps=max_steps)
-            eval_payload = None
-            if config.eval.enabled:
-                arena = Arena(config, eval_dir=paths.run_dir / "eval", event_writer=event_writer)
-                eval_result = arena.evaluate_vs_random(
-                    params=train_result.state.params,
-                    checkpoint_version=train_result.checkpoint_version,
-                )
-                promoted = (
-                    should_promote(
-                        eval_result,
-                        min_games=config.eval.games,
-                        promotion_win_rate=config.eval.promotion_win_rate,
-                    )
-                    or not checkpoint_manager.best_path.exists()
-                )
-                if promoted:
-                    checkpoint_manager.promote(train_result.checkpoint_version)
-                eval_payload = {
-                    "checkpoint_version": eval_result.checkpoint_version,
-                    "games": eval_result.games,
-                    "wins": eval_result.wins,
-                    "losses": eval_result.losses,
-                    "draws": eval_result.draws,
-                    "win_rate": eval_result.win_rate,
-                    "promoted": promoted,
-                }
+            result = RunOrchestrator(
+                config,
+                paths=paths,
+                runtime_backend=runtime,
+                event_writer=event_writer,
+                metric_writer=metric_writer,
+            ).run()
         except Exception as exc:
-            state.update(
+            latest_state = state
+            if paths.run_state_path.exists():
+                import json
+
+                latest_state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))
+            latest_state.update(
                 {
                     "status": "failed",
                     "failure_stage": "local_multiprocess_training",
                     "error": repr(exc),
                     "worker_runtime_backend": message["runtime_backend"],
                     "worker_exitcode": process.exitcode,
-                    "games_seen": message["games"],
-                    "samples_seen": message["positions"],
-                    "replay_shard": message["replay_shard"],
                 }
             )
-            atomic_write_json(paths.run_state_path, state)
+            atomic_write_json(paths.run_state_path, latest_state)
             event_writer.write(
                 {
                     "event": "local_multiprocess_training_failed",
@@ -288,18 +208,15 @@ class LocalMultiprocessExecutionBackend:
                 }
             )
             raise
-        state.update(
+        import json
+
+        latest_state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))
+        latest_state.update(
             {
-                "status": "completed",
-                "train_step": train_result.checkpoint_version,
-                "games_seen": message["games"],
-                "samples_seen": message["positions"],
-                "replay_shard": message["replay_shard"],
+                "status": result.status,
                 "worker_runtime_backend": message["runtime_backend"],
                 "worker_exitcode": process.exitcode,
-                "checkpoint_version": train_result.checkpoint_version,
-                "eval": eval_payload,
             }
         )
-        atomic_write_json(paths.run_state_path, state)
-        return ExecutionResult(paths.run_id, paths.run_dir, "completed")
+        atomic_write_json(paths.run_state_path, latest_state)
+        return result

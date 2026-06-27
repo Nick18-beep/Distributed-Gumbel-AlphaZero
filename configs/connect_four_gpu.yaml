@@ -23,13 +23,13 @@ logging:
 
 game:
   name: connect_four
-  implementation: custom_jax
+  implementation: torch
 
 algorithm:
   name: gumbel_alphazero
 
 search:
-  backend: mctx
+  backend: torch_gumbel
   simulations_per_move: 256
   max_num_considered_actions: 7
   gumbel_scale: 1.0
@@ -70,4 +70,3 @@ stop:
   max_train_steps: null
   max_games: null
   max_wall_time_sec: null
-

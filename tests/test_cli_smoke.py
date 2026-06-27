@@ -96,6 +96,38 @@ def test_run_initializes_single_process_backend(
     assert (tmp_path / "artifacts" / "runs" / "latest.json").exists()
 
 
+def test_run_accepts_execution_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--config",
+            str(DEBUG_CONFIG),
+            "--execution",
+            "single_process",
+            "--set",
+            "selfplay.games_per_iteration=1",
+            "--set",
+            "stop.max_games=1",
+            "--set",
+            "search.simulations_per_move=2",
+            "--set",
+            "training.batch_size=4",
+            "--set",
+            "training.steps_per_iteration=1",
+            "--set",
+            "stop.max_train_steps=1",
+            "--set",
+            "eval.games=2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "run completed:" in result.output
+
+
 def test_registered_dev_config_commands_run_smoke(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -138,6 +170,68 @@ def test_registered_dev_config_commands_run_smoke(
 
         assert result.exit_code == 0
         assert f"{command} completed:" in result.output
+
+
+def test_selfplay_accepts_games_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "selfplay",
+            "--config",
+            str(DEBUG_CONFIG),
+            "--games",
+            "1",
+            "--set",
+            "selfplay.batch_size=1",
+            "--set",
+            "search.simulations_per_move=2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "selfplay completed:" in result.output
+
+
+def test_benchmark_accepts_output_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    output_dir = tmp_path / "bench"
+
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            "--config",
+            str(DEBUG_CONFIG),
+            "--output-dir",
+            str(output_dir),
+            "--set",
+            "selfplay.games_per_iteration=1",
+            "--set",
+            "selfplay.batch_size=1",
+            "--set",
+            "search.simulations_per_move=2",
+            "--set",
+            "replay.min_samples_to_train=1",
+            "--set",
+            "training.batch_size=4",
+            "--set",
+            "training.steps_per_iteration=1",
+            "--set",
+            "training.checkpoint_every_steps=1",
+            "--set",
+            "eval.games=2",
+            "--set",
+            "stop.max_games=1",
+            "--set",
+            "stop.max_train_steps=1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "benchmark written:" in result.output
+    assert any(output_dir.glob("benchmark_*.jsonl"))
 
 
 def test_lan_ray_without_ray_reports_optional_dependency(
@@ -231,6 +325,105 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
     assert "Ray multi-node on macOS is experimental" in result.output
     assert calls[0]["command"] == ["ray", "start", "--address=192.168.1.12:6379"]
     assert calls[0]["env"]["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
+
+
+def test_cluster_head_wait_workers_uses_resolved_lan_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+    waits: list[dict] = []
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ray":
+            return object()
+        return real_import(name, globals, locals, fromlist, level)
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return subprocess.CompletedProcess(command, 0)
+
+    def fake_wait(**kwargs) -> None:
+        waits.append(kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main, "_detect_lan_ip", lambda: "192.168.1.12")
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "_wait_for_ray_workers", fake_wait)
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "head",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "connect_four_lan.yaml"),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "6380",
+            "--wait-workers",
+            "--min-workers",
+            "2",
+            "--timeout-sec",
+            "10",
+            "--poll-sec",
+            "0.5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["command"] == [
+        "ray",
+        "start",
+        "--head",
+        "--node-ip-address=192.168.1.12",
+        "--port=6380",
+        "--include-dashboard=false",
+        "--disable-usage-stats",
+    ]
+    assert waits == [
+        {
+            "head": "192.168.1.12:6380",
+            "min_workers": 2,
+            "timeout_sec": 10.0,
+            "poll_sec": 0.5,
+        }
+    ]
+
+
+def test_cluster_wait_passes_parameters_to_worker_watcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[dict] = []
+    monkeypatch.setattr(cli_main, "_wait_for_ray_workers", lambda **kwargs: waits.append(kwargs))
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "wait",
+            "--head",
+            "192.168.1.12:6379",
+            "--min-workers",
+            "3",
+            "--timeout-sec",
+            "12",
+            "--poll-sec",
+            "0.25",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert waits == [
+        {
+            "head": "192.168.1.12:6379",
+            "min_workers": 3,
+            "timeout_sec": 12.0,
+            "poll_sec": 0.25,
+        }
+    ]
 
 
 def test_config_command_accepts_override() -> None:

@@ -1,35 +1,32 @@
-"""Sequential halving candidate helper."""
+"""Sequential halving utilities for PyTorch search."""
 
 from __future__ import annotations
 
-import math
-
-import jax
-import jax.numpy as jnp
+import torch
 
 
-def select_candidates(
-    scores: jax.Array,
-    legal_mask: jax.Array,
+def top_k_candidates(
+    scores: torch.Tensor,
+    legal_mask: torch.Tensor,
     max_num_considered_actions: int,
-) -> jax.Array:
-    max_actions = min(max_num_considered_actions, scores.shape[-1])
-    masked_scores = jnp.where(legal_mask, scores, -jnp.inf)
-    order = jnp.argsort(masked_scores, axis=-1)[..., ::-1]
-    return order[..., :max_actions]
+) -> torch.Tensor:
+    masked = torch.where(legal_mask.bool(), scores, torch.full_like(scores, -torch.inf))
+    k = min(max_num_considered_actions, scores.shape[-1])
+    candidates = torch.topk(masked, k=k, dim=-1).indices
+    candidate_legal = torch.gather(legal_mask.bool(), dim=-1, index=candidates)
+    best_legal = torch.argmax(masked, dim=-1, keepdim=True)
+    return torch.where(candidate_legal, candidates, best_legal.expand_as(candidates))
 
 
 def sequential_halving(
-    scores: jax.Array,
-    legal_mask: jax.Array,
+    scores: torch.Tensor,
+    legal_mask: torch.Tensor,
     max_num_considered_actions: int,
-) -> jax.Array:
-    candidates = select_candidates(scores, legal_mask, max_num_considered_actions)
-    rounds = max(1, math.ceil(math.log2(candidates.shape[-1])))
-    active = candidates
-    for _ in range(rounds):
-        keep = max(1, active.shape[-1] // 2)
-        candidate_scores = jnp.take_along_axis(scores, active, axis=-1)
-        order = jnp.argsort(candidate_scores, axis=-1)[..., ::-1]
-        active = jnp.take_along_axis(active, order[..., :keep], axis=-1)
-    return active[..., 0]
+) -> torch.Tensor:
+    active = top_k_candidates(scores, legal_mask, max_num_considered_actions)
+    while active.shape[-1] > 1:
+        candidate_scores = torch.gather(scores, dim=-1, index=active)
+        keep = max(1, (active.shape[-1] + 1) // 2)
+        order = torch.topk(candidate_scores, k=keep, dim=-1).indices
+        active = torch.gather(active, dim=-1, index=order)
+    return active.squeeze(-1)

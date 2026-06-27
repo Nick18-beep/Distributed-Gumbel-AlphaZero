@@ -29,7 +29,7 @@ class CheckResult:
 
 
 BASE_IMPORTS = ("pydantic", "typer", "yaml", "numpy", "msgpack", "zstandard")
-ML_IMPORTS = ("jax", "flax", "optax", "orbax.checkpoint", "torch")
+ML_IMPORTS = ("torch",)
 OPTIONAL_EXTRA_MARKERS = {
     "dev": ("pytest", "ruff", "mypy"),
     "distributed": ("ray",),
@@ -186,50 +186,46 @@ def _run_uv_sync(uv_path: str, project_root: Path, reporter: Reporter) -> CheckR
     return CheckResult("ERROR", "uv sync", f"exit code {result.returncode}")
 
 
-def _jax_checks(cuda_requested: bool) -> tuple[list[CheckResult], bool]:
+def _torch_checks(cuda_requested: bool) -> list[CheckResult]:
     results: list[CheckResult] = []
-    if _safe_find_spec("jax") is None:
-        status = "ERROR" if cuda_requested else "WARN"
-        results.append(CheckResult(status, "jax", "not installed"))
-        return results, False
+    if _safe_find_spec("torch") is None:
+        results.append(CheckResult("ERROR", "torch", "not installed"))
+        return results
 
     try:
-        import jax
+        import torch
     except Exception as exc:
-        status = "ERROR" if cuda_requested else "WARN"
-        results.append(CheckResult(status, "jax", f"{type(exc).__name__}: {exc}"))
-        return results, False
+        results.append(CheckResult("ERROR", "torch", f"{type(exc).__name__}: {exc}"))
+        return results
 
-    devices = list(jax.devices())
-    platforms = sorted({getattr(device, "platform", "unknown") for device in devices})
-    has_gpu = any(platform_name in {"cuda", "gpu", "rocm"} for platform_name in platforms)
-
-    results.append(CheckResult("OK", "jax", getattr(jax, "__version__", "installed")))
-    results.append(CheckResult("OK", "jax devices", ", ".join(map(str, devices))))
-    results.append(CheckResult("OK", "jax backend", ", ".join(platforms) or "unknown"))
+    cuda_available = torch.cuda.is_available()
+    mps_available = (
+        getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+    )
+    results.append(CheckResult("OK", "torch", getattr(torch, "__version__", "installed")))
+    results.append(CheckResult("OK", "torch cuda available", str(cuda_available)))
+    if cuda_available:
+        devices = [
+            f"cuda:{index} {torch.cuda.get_device_name(index)}"
+            for index in range(torch.cuda.device_count())
+        ]
+        results.append(CheckResult("OK", "torch cuda devices", ", ".join(devices)))
+    results.append(CheckResult("OK", "torch mps available", str(mps_available)))
 
     if cuda_requested:
-        if _os_name() == "Windows":
-            results.append(
-                CheckResult(
-                    "ERROR",
-                    "cuda on Windows",
-                    "JAX NVIDIA GPU is not supported on native Windows; use Linux/WSL2.",
-                )
-            )
-        elif not has_gpu:
-            results.append(CheckResult("ERROR", "cuda devices", "no CUDA/ROCm JAX device found"))
+        if not cuda_available:
+            results.append(CheckResult("ERROR", "cuda devices", "no PyTorch CUDA device found"))
         else:
-            results.append(CheckResult("OK", "cuda devices", "GPU backend detected"))
+            results.append(CheckResult("OK", "cuda devices", "PyTorch CUDA detected"))
 
-    return results, has_gpu
+    return results
 
 
 def _runtime_backend_check() -> CheckResult:
     from gumbel_az.runtime import detect_runtime_backend
 
     backend = detect_runtime_backend()
-    status = "OK" if backend.name == "jax" else "WARN" if backend.name == "torch" else "ERROR"
+    status = "OK" if backend.name == "torch" else "ERROR"
     return CheckResult(status, "runtime backend", f"{backend.name}: {backend.reason}")
 
 
@@ -302,8 +298,7 @@ def run_doctor(
                 )
             )
 
-    jax_results, _ = _jax_checks(cuda)
-    results.extend(jax_results)
+    results.extend(_torch_checks(cuda))
     results.append(_runtime_backend_check())
 
     results.append(_write_artifacts_check(project_root, fix=fix))

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
+import torch
 
 from gumbel_az.config import load_config
 from gumbel_az.envs import create_game
@@ -15,17 +14,19 @@ def test_mlp_init_is_deterministic_and_uses_num_actions() -> None:
     config = load_config(CONFIG_DIR / "connect_four_cpu_debug.yaml")
     game = create_game(config.game.name)
     network = create_network(config.model, num_actions=game.num_actions + 2)
-    key = jax.random.PRNGKey(0)
 
-    params_a = network.init(key, game.observation_shape, game.num_actions + 2)
-    params_b = network.init(key, game.observation_shape, game.num_actions + 2)
-    output = network.apply(params_a, jnp.zeros((3, *game.observation_shape), dtype=jnp.float32))
+    model_a = network.init(0, game.observation_shape, game.num_actions + 2)
+    model_b = network.init(0, game.observation_shape, game.num_actions + 2)
+    output = model_a(torch.zeros((3, *game.observation_shape), dtype=torch.float32))
 
-    assert jax.tree.all(jax.tree.map(lambda a, b: jnp.array_equal(a, b), params_a, params_b))
+    assert all(
+        torch.equal(model_a.state_dict()[key], model_b.state_dict()[key])
+        for key in model_a.state_dict()
+    )
     assert output.policy_logits.shape == (3, game.num_actions + 2)
     assert output.value.shape == (3,)
-    assert jnp.all(output.value <= 1.0)
-    assert jnp.all(output.value >= -1.0)
+    assert torch.all(output.value <= 1.0)
+    assert torch.all(output.value >= -1.0)
 
 
 def test_resnet_forward_shapes() -> None:
@@ -33,8 +34,8 @@ def test_resnet_forward_shapes() -> None:
     game = create_game(config.game.name)
     network = create_network(config.model, num_actions=game.num_actions)
 
-    params = network.init(jax.random.PRNGKey(1), game.observation_shape, game.num_actions)
-    output = network.apply(params, jnp.zeros((2, *game.observation_shape), dtype=jnp.float32))
+    model = network.init(1, game.observation_shape, game.num_actions)
+    output = model(torch.zeros((2, *game.observation_shape), dtype=torch.float32))
 
     assert output.policy_logits.shape == (2, game.num_actions)
     assert output.value.shape == (2,)
@@ -46,7 +47,7 @@ def test_model_init_rejects_num_actions_mismatch() -> None:
     network = create_network(config.model, num_actions=game.num_actions)
 
     try:
-        network.init(jax.random.PRNGKey(0), game.observation_shape, game.num_actions + 1)
+        network.init(0, game.observation_shape, game.num_actions + 1)
     except ValueError as exc:
         assert "num_actions" in str(exc)
     else:

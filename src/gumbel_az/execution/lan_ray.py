@@ -44,23 +44,16 @@ def _enable_ray_experimental_multinode_if_needed() -> None:
 
 def detect_worker_capabilities(worker_id: str | None = None) -> WorkerCapabilities:
     runtime = detect_runtime_backend()
-    devices: tuple[str, ...] = ()
-    has_gpu = False
-    if runtime.name == "jax":
-        try:
-            import jax
-
-            devices = tuple(str(device) for device in jax.devices())
-            has_gpu = any("gpu" in device.lower() or "cuda" in device.lower() for device in devices)
-        except Exception:
-            devices = ()
+    devices: tuple[str, ...] = (runtime.device,)
+    has_gpu = runtime.device == "cuda"
     return WorkerCapabilities(
         worker_id=worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:8]}",
         hostname=socket.gethostname(),
         platform=platform.platform(),
         cpu_count=os.cpu_count() or 1,
         runtime_backend=runtime.name,
-        jax_devices=devices,
+        torch_device=runtime.device,
+        torch_devices=devices,
         has_gpu=has_gpu,
     )
 
@@ -202,23 +195,25 @@ class WorkerActorCore:
         config = AppConfig.model_validate(config_data)
         replay_dir = work_dir / self.capabilities.worker_id / "replay"
         runtime = detect_runtime_backend()
-        if runtime.name == "jax":
-            from gumbel_az.replay import ReplayWriter
-            from gumbel_az.selfplay.worker import SelfPlayWorker
-
-            worker = SelfPlayWorker(config, replay_writer=ReplayWriter(replay_dir))
-        elif runtime.name == "torch":
-            from gumbel_az.replay import ReplayWriter
-            from gumbel_az.selfplay.torch_fallback import TorchFallbackSelfPlayWorker
-
-            worker = TorchFallbackSelfPlayWorker(config, replay_writer=ReplayWriter(replay_dir))
-        else:
+        if runtime.name != "torch":
             raise RuntimeError(runtime.reason)
+        from gumbel_az.replay import ReplayWriter
+        from gumbel_az.selfplay.worker import SelfPlayWorker
+
+        worker = SelfPlayWorker(
+            config,
+            replay_writer=ReplayWriter(replay_dir),
+            device=runtime.device,
+        )
         _, result = worker.play_batch(games, seed)
+        shard_path = Path(result.replay_shard)
         return {
             "worker_id": self.capabilities.worker_id,
             "runtime_backend": runtime.name,
+            "device": runtime.device,
             "replay_shard": result.replay_shard,
+            "replay_shard_name": shard_path.name,
+            "replay_shard_bytes": shard_path.read_bytes(),
             "games": result.games,
             "positions": result.positions,
             "games_per_sec": result.games_per_sec,
@@ -296,6 +291,54 @@ class LanRayExecutionBackend:
                 ),
             }
         )
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        remote_worker_count = max(0, len(alive_nodes) - 1)
+        if remote_worker_count > 0:
+            games = min(
+                config.stop.max_games or config.selfplay.games_per_iteration,
+                config.selfplay.games_per_iteration,
+            )
+            actors = [
+                make_ray_worker_actor().remote()
+                for _ in range(min(remote_worker_count, games))
+            ]
+            games_per_actor = [games // len(actors)] * len(actors)
+            for index in range(games % len(actors)):
+                games_per_actor[index] += 1
+            futures = [
+                actor.generate_replay_shard.remote(
+                    config.model_dump(mode="json"),
+                    work_dir=paths.run_dir / "ray_worker_tmp",
+                    games=actor_games,
+                    seed=config.run.seed + 100_000 + index * 10_000,
+                )
+                for index, (actor, actor_games) in enumerate(
+                    zip(actors, games_per_actor, strict=True)
+                )
+                if actor_games > 0
+            ]
+            head = HeadController(run_dir=paths.run_dir, event_writer=event_writer)
+            upload_dir = paths.run_dir / "ray_uploads"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            for payload in ray.get(futures):
+                shard_path = upload_dir / f"{payload['worker_id']}_{payload['replay_shard_name']}"
+                shard_path.write_bytes(payload.pop("replay_shard_bytes"))
+                imported = head.upload_replay_shard(payload["worker_id"], str(shard_path))
+                event_writer.write(
+                    {
+                        "event": "lan_ray_remote_selfplay_completed",
+                        **payload,
+                        "imported": imported,
+                    }
+                )
+        else:
+            event_writer.write(
+                {
+                    "event": "lan_ray_no_remote_workers",
+                    "run_id": paths.run_id,
+                    "note": "No remote Ray worker nodes were available; using head self-play.",
+                }
+            )
         return RunOrchestrator(
             config,
             paths=paths,

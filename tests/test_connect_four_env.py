@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 from gumbel_az.envs.custom.connect_four import COLUMNS, ROWS, ConnectFourGame
@@ -89,9 +87,9 @@ def test_draw_detection_with_full_board_without_four() -> None:
         [1, -1, -1, 1, 1, -1, 1],
     ]
     state = game.init()._replace(
-        board=jnp.asarray(rows, dtype=jnp.int8),
-        move_count=jnp.asarray(42, dtype=jnp.int16),
-        terminated=jnp.asarray(True),
+        board=np.asarray(rows, dtype=np.int8),
+        move_count=np.asarray(42, dtype=np.int16),
+        terminated=np.asarray(True),
     )
 
     assert bool(game.is_terminal(state))
@@ -176,29 +174,30 @@ def test_canonical_observation_tracks_current_player_perspective() -> None:
 
 def test_horizontal_symmetry_flips_observation_and_actions() -> None:
     game = ConnectFourGame()
-    observation = jnp.arange(ROWS * COLUMNS * 2).reshape((ROWS, COLUMNS, 2))
+    observation = np.arange(ROWS * COLUMNS * 2).reshape((ROWS, COLUMNS, 2))
     sample = {
         "observation": observation,
-        "legal_action_mask": jnp.asarray([True, False, True, False, True, False, True]),
-        "policy_target": jnp.arange(COLUMNS),
+        "legal_action_mask": np.asarray([True, False, True, False, True, False, True]),
+        "policy_target": np.arange(COLUMNS),
     }
 
     original, flipped = game.symmetries(sample)
 
     assert original is sample
-    np.testing.assert_array_equal(flipped["observation"], jnp.flip(observation, axis=1))
+    np.testing.assert_array_equal(flipped["observation"], np.flip(observation, axis=1))
     assert flipped["legal_action_mask"].tolist() == [True, False, True, False, True, False, True]
     assert flipped["policy_target"].tolist() == [6, 5, 4, 3, 2, 1, 0]
 
 
-def test_step_supports_jit_and_vmap() -> None:
+def test_step_supports_looped_batch_usage() -> None:
     game = ConnectFourGame()
     state = game.init()
 
-    jitted_state = jax.jit(game.step)(state, 0)
-    assert int(jitted_state.current_player) == 1
+    next_states = [game.step(state, action) for action in (0, 1)]
 
-    states = jax.tree.map(lambda value: jnp.stack([value, value]), state)
-    actions = jnp.asarray([0, 1])
-    next_states = jax.vmap(game.step)(states, actions)
-    assert next_states.board.shape == (2, ROWS, COLUMNS)
+    assert [int(next_state.current_player) for next_state in next_states] == [1, 1]
+    assert np.stack([next_state.board for next_state in next_states]).shape == (
+        2,
+        ROWS,
+        COLUMNS,
+    )

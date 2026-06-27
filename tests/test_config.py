@@ -86,6 +86,17 @@ def test_overrides_are_applied() -> None:
     assert config.eval.enabled is False
 
 
+def test_training_compile_defaults_to_auto_and_can_be_overridden() -> None:
+    default_config = load_config(CONFIG_DIR / "connect_four_cpu_debug.yaml")
+    override_config = load_config(
+        CONFIG_DIR / "connect_four_cpu_debug.yaml",
+        ["training.compile=off"],
+    )
+
+    assert default_config.training.compile == "auto"
+    assert override_config.training.compile == "off"
+
+
 def test_parse_override_requires_equals() -> None:
     with pytest.raises(ValueError, match="KEY=VALUE"):
         parse_override("run.seed")

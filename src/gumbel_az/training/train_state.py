@@ -1,53 +1,76 @@
-"""Train state and jitted train step."""
+"""PyTorch train state and train step."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from dataclasses import dataclass
 
-import flax.struct
-import jax
-import jax.numpy as jnp
-import optax
-from flax.training.train_state import TrainState
+import torch
 
-from gumbel_az.model.common import NetworkOutput
+from gumbel_az.config.schema import TrainingConfig
 from gumbel_az.model.loss import total_loss
+from gumbel_az.model.optimizer import WarmupCosineSchedule
 
 
-class GAZTrainState(TrainState):
-    apply_fn: flax.struct.PyTreeNode = flax.struct.field(pytree_node=False)
+@dataclass
+class TorchTrainState:
+    model: torch.nn.Module
+    optimizer: torch.optim.Optimizer
+    schedule: WarmupCosineSchedule
+    step: int
+    device: torch.device
+    scaler: torch.amp.GradScaler | None = None
+    compile_enabled: bool = False
+    compile_mode: str = "eager"
 
 
-def create_train_state(
-    *,
-    params: dict,
-    apply_fn: Callable[[dict, jax.Array, bool], NetworkOutput],
-    tx: optax.GradientTransformation,
-) -> GAZTrainState:
-    return GAZTrainState.create(apply_fn=apply_fn, params=params, tx=tx)
+def _global_grad_norm(model: torch.nn.Module) -> float:
+    norms = [
+        param.grad.detach().norm(2)
+        for param in model.parameters()
+        if param.grad is not None
+    ]
+    if not norms:
+        return 0.0
+    return float(torch.norm(torch.stack(norms), 2).detach().cpu())
 
 
-def _global_norm(tree) -> jax.Array:
-    leaves = jax.tree.leaves(tree)
-    return jnp.sqrt(sum(jnp.sum(jnp.square(leaf)) for leaf in leaves))
-
-
-@jax.jit
 def train_step(
-    state: GAZTrainState,
-    batch: dict[str, jax.Array],
-    learning_rate: jax.Array,
-) -> tuple[GAZTrainState, dict[str, jax.Array]]:
-    def loss_fn(params: dict) -> tuple[jax.Array, dict[str, jax.Array]]:
-        outputs = state.apply_fn(params, batch["observation"], True)
-        return total_loss(outputs, batch)
-
-    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    new_state = state.apply_gradients(grads=grads)
-    metrics = {
-        **metrics,
-        "loss": loss,
-        "learning_rate": learning_rate,
-        "grad_norm": _global_norm(grads),
-    }
-    return new_state, metrics
+    state: TorchTrainState,
+    batch: dict[str, torch.Tensor],
+    config: TrainingConfig,
+) -> tuple[TorchTrainState, dict[str, float]]:
+    state.model.train()
+    lr = state.schedule(state.step)
+    for group in state.optimizer.param_groups:
+        group["lr"] = lr
+    state.optimizer.zero_grad(set_to_none=True)
+    use_amp = state.device.type == "cuda"
+    with torch.autocast(device_type=state.device.type, enabled=use_amp):
+        outputs = state.model(batch["observation"])
+        loss, loss_metrics = total_loss(outputs, batch)
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"non-finite training loss: {float(loss.detach().cpu())}")
+    if state.scaler is not None and use_amp:
+        state.scaler.scale(loss).backward()
+        state.scaler.unscale_(state.optimizer)
+        if config.gradient_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(state.model.parameters(), config.gradient_clip_norm)
+        grad_norm = _global_grad_norm(state.model)
+        state.scaler.step(state.optimizer)
+        state.scaler.update()
+    else:
+        loss.backward()
+        if config.gradient_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(state.model.parameters(), config.gradient_clip_norm)
+        grad_norm = _global_grad_norm(state.model)
+        state.optimizer.step()
+    state.step += 1
+    metrics = {key: float(value.detach().cpu()) for key, value in loss_metrics.items()}
+    metrics.update(
+        {
+            "loss": float(loss.detach().cpu()),
+            "learning_rate": float(lr),
+            "grad_norm": grad_norm,
+        }
+    )
+    return state, metrics

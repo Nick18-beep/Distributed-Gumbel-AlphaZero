@@ -35,7 +35,8 @@ class WorkerCapabilities:
     platform: str
     cpu_count: int
     runtime_backend: str
-    jax_devices: tuple[str, ...] = ()
+    torch_device: str = "cpu"
+    torch_devices: tuple[str, ...] = ()
     has_gpu: bool = False
 
 
@@ -57,7 +58,8 @@ class WorkerRecord:
                 "platform": self.capabilities.platform,
                 "cpu_count": self.capabilities.cpu_count,
                 "runtime_backend": self.capabilities.runtime_backend,
-                "jax_devices": list(self.capabilities.jax_devices),
+                "torch_device": self.capabilities.torch_device,
+                "torch_devices": list(self.capabilities.torch_devices),
                 "has_gpu": self.capabilities.has_gpu,
             },
             "status": self.status,

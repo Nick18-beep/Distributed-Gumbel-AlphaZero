@@ -87,7 +87,7 @@ def _validate_checkpoint_pointer(pointer: dict[str, Any]) -> None:
     checkpoint_dir = Path(pointer["path"])
     if not checkpoint_dir.exists():
         raise FileNotFoundError(checkpoint_dir)
-    required = ("_CHECKPOINT_METADATA", "_METADATA")
+    required = ("checkpoint.pt",)
     missing = [name for name in required if not (checkpoint_dir / name).exists()]
     if missing:
         raise FileNotFoundError(

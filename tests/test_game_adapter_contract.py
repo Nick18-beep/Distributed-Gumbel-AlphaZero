@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
+import numpy as np
 
 from gumbel_az.domain.game import GameAdapter
 from gumbel_az.envs import create_game, registered_games
 
 
 def _assert_contract(game: GameAdapter) -> None:
-    state = game.init(jax.random.PRNGKey(0))
+    state = game.init(0)
     legal = game.legal_action_mask(state)
     observation = game.canonical_observation(state)
     rewards = game.rewards(state)
 
     assert game.num_players == 2
     assert legal.shape == (game.num_actions,)
-    assert legal.dtype == jnp.bool_
+    assert legal.dtype == np.bool_
     assert observation.shape == game.observation_shape
     assert rewards.shape == (game.num_players,)
     assert int(game.current_player(state)) == 0
