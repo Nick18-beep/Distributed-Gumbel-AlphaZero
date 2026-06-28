@@ -33,28 +33,130 @@ Python supportato: 3.11, 3.12, 3.13. Python 3.14 non e' supportato per ora.
 
 ## Quickstart LAN Ray
 
-Ray e' opzionale e sta dietro `ExecutionBackend`.
+Ray e' opzionale e sta dietro `ExecutionBackend`. Il trainer resta sul master/head;
+i worker generano self-play replay shard e li inviano al master.
 
-Master/head:
+Prerequisiti su ogni macchina:
 
 ```bash
-uv run --extra cpu --extra distributed gaz cluster head --config configs/connect_four_lan.yaml --host 0.0.0.0 --port 6379 --wait-workers --min-workers 1
+cd Distributed-Gumbel-AlphaZero
+python --version
+uv sync --extra cpu --extra distributed
 ```
 
-Worker:
+Sul master con GPU usare invece:
 
 ```bash
-uv run --extra cpu --extra distributed gaz cluster worker --head 192.168.1.50:6379 --config configs/connect_four_lan.yaml --auto
+python scripts/bootstrap.py --profile cuda --profile distributed
+uv run --extra cuda --extra distributed gaz doctor --cuda --distributed
 ```
 
-Training LAN dal master:
+### 1. Master/head
+
+Aprire il primo terminale sul master. Su Windows PowerShell:
+
+```powershell
+cd "D:\nicol\Distributed Gumbel AlphaZero"
+.\.venv\Scripts\ray.exe stop --force
+
+uv run --extra cuda --extra distributed gaz cluster head `
+  --config configs/connect_four_lan.yaml `
+  --host 0.0.0.0 `
+  --port 6379 `
+  --wait-workers `
+  --min-workers 1
+```
+
+Se il master non deve usare GPU, sostituire `--extra cuda` con `--extra cpu`.
+
+Il comando stampa l'indirizzo da usare sui worker, per esempio:
+
+```text
+ray head address for workers: 192.168.1.12:6379
+```
+
+Lasciare questo terminale aperto.
+
+### 2. Worker
+
+Su un worker Linux/WSL2:
 
 ```bash
-uv run --extra cpu --extra distributed gaz run --config configs/connect_four_lan.yaml --execution lan_ray --set cluster.head_address=192.168.1.50:6379
+cd /path/to/Distributed-Gumbel-AlphaZero
+ray stop --force
+
+uv run --extra cpu --extra distributed gaz cluster worker \
+  --head 192.168.1.12:6379 \
+  --config configs/connect_four_lan.yaml \
+  --auto
+```
+
+Su un worker macOS:
+
+```bash
+cd /Users/nicolo/Desktop/Distributed-Gumbel-AlphaZero
+ray stop --force
+export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+MAC_IP=$(ipconfig getifaddr en0)
+
+uv run --extra cpu --extra distributed gaz cluster worker \
+  --head 192.168.1.12:6379 \
+  --node-ip "$MAC_IP" \
+  --config configs/connect_four_lan.yaml \
+  --auto
+```
+
+Se `MAC_IP` e' vuoto, usare l'IP LAN manuale:
+
+```bash
+uv run --extra cpu --extra distributed gaz cluster worker \
+  --head 192.168.1.12:6379 \
+  --node-ip 192.168.1.161 \
+  --config configs/connect_four_lan.yaml \
+  --auto
 ```
 
 Su Windows/macOS la CLI imposta automaticamente
 `RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1` per i comandi Ray multi-node.
+
+### 3. Training distribuito
+
+Quando il terminale master mostra che i worker richiesti sono connessi, aprire un
+secondo terminale sul master:
+
+```powershell
+cd "D:\nicol\Distributed Gumbel AlphaZero"
+
+uv run --extra cuda --extra distributed gaz run `
+  --config configs/connect_four_lan.yaml `
+  --execution lan_ray `
+  --set cluster.head_address=192.168.1.12:6379
+```
+
+Sostituire `192.168.1.12:6379` con l'indirizzo stampato dal comando head.
+Se il master non usa GPU, usare `--extra cpu`.
+
+### 4. Verifica e stop
+
+Controllare lo stato del cluster dal master:
+
+```powershell
+uv run --extra cuda --extra distributed gaz cluster status --head 192.168.1.12:6379
+```
+
+Fermare Ray quando il training e' concluso.
+
+Master Windows:
+
+```powershell
+.\.venv\Scripts\ray.exe stop --force
+```
+
+Worker Linux/macOS:
+
+```bash
+ray stop --force
+```
 
 ## Comandi principali
 
