@@ -137,6 +137,70 @@ def _ray_node_ip(host: str) -> str:
     return host
 
 
+def _ray_port_args(
+    *,
+    node_manager_port: int | None = None,
+    object_manager_port: int | None = None,
+    runtime_env_agent_port: int | None = None,
+    dashboard_agent_listen_port: int | None = None,
+    dashboard_agent_grpc_port: int | None = None,
+    metrics_export_port: int | None = None,
+    min_worker_port: int | None = None,
+    max_worker_port: int | None = None,
+) -> list[str]:
+    if (min_worker_port is None) != (max_worker_port is None):
+        raise typer.BadParameter("--min-worker-port and --max-worker-port must be set together")
+    if (
+        min_worker_port is not None
+        and max_worker_port is not None
+        and min_worker_port > max_worker_port
+    ):
+        raise typer.BadParameter("--min-worker-port cannot be greater than --max-worker-port")
+
+    args: list[str] = []
+    if node_manager_port is not None:
+        args.append(f"--node-manager-port={node_manager_port}")
+    if object_manager_port is not None:
+        args.append(f"--object-manager-port={object_manager_port}")
+    if runtime_env_agent_port is not None:
+        args.append(f"--runtime-env-agent-port={runtime_env_agent_port}")
+    if dashboard_agent_listen_port is not None:
+        args.append(f"--dashboard-agent-listen-port={dashboard_agent_listen_port}")
+    if dashboard_agent_grpc_port is not None:
+        args.append(f"--dashboard-agent-grpc-port={dashboard_agent_grpc_port}")
+    if metrics_export_port is not None:
+        args.append(f"--metrics-export-port={metrics_export_port}")
+    if min_worker_port is not None and max_worker_port is not None:
+        args.extend(
+            [
+                f"--min-worker-port={min_worker_port}",
+                f"--max-worker-port={max_worker_port}",
+            ]
+        )
+    return args
+
+
+def _ray_worker_command_hint(
+    *,
+    head: str,
+    config: Path,
+    ray_port_args: list[str],
+    include_node_ip_placeholder: bool,
+) -> str:
+    config_path = config.as_posix()
+    command = [
+        "gaz",
+        "cluster",
+        "worker",
+        "--head",
+        head,
+    ]
+    if include_node_ip_placeholder:
+        command.extend(["--node-ip", "WORKER_LAN_IP"])
+    command.extend(["--config", config_path, *ray_port_args, "--auto"])
+    return " ".join(command)
+
+
 def _ray_cluster_env() -> dict[str, str]:
     env = os.environ.copy()
     if sys.platform in {"win32", "darwin"}:
@@ -677,6 +741,63 @@ def cluster_head(
         float,
         typer.Option("--poll-sec", min=0.1, help="Worker polling interval in seconds."),
     ] = 2.0,
+    node_manager_port: Annotated[
+        int | None,
+        typer.Option("--node-manager-port", min=1, max=65535, help="Fixed Ray node manager port."),
+    ] = None,
+    object_manager_port: Annotated[
+        int | None,
+        typer.Option(
+            "--object-manager-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray object manager port.",
+        ),
+    ] = None,
+    runtime_env_agent_port: Annotated[
+        int | None,
+        typer.Option(
+            "--runtime-env-agent-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray runtime env agent port.",
+        ),
+    ] = None,
+    dashboard_agent_listen_port: Annotated[
+        int | None,
+        typer.Option(
+            "--dashboard-agent-listen-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray dashboard agent HTTP port.",
+        ),
+    ] = None,
+    dashboard_agent_grpc_port: Annotated[
+        int | None,
+        typer.Option(
+            "--dashboard-agent-grpc-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray dashboard agent gRPC port.",
+        ),
+    ] = None,
+    metrics_export_port: Annotated[
+        int | None,
+        typer.Option(
+            "--metrics-export-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray metrics export port.",
+        ),
+    ] = None,
+    min_worker_port: Annotated[
+        int | None,
+        typer.Option("--min-worker-port", min=1, max=65535, help="First fixed Ray worker port."),
+    ] = None,
+    max_worker_port: Annotated[
+        int | None,
+        typer.Option("--max-worker-port", min=1, max=65535, help="Last fixed Ray worker port."),
+    ] = None,
 ) -> None:
     """Start a Ray head node."""
     _validate_config(config, overrides)
@@ -685,10 +806,25 @@ def cluster_head(
     platform_warning = _ray_cluster_platform_warning()
     if platform_warning is not None:
         typer.echo(platform_warning)
+    ray_port_args = _ray_port_args(
+        node_manager_port=node_manager_port,
+        object_manager_port=object_manager_port,
+        runtime_env_agent_port=runtime_env_agent_port,
+        dashboard_agent_listen_port=dashboard_agent_listen_port,
+        dashboard_agent_grpc_port=dashboard_agent_grpc_port,
+        metrics_export_port=metrics_export_port,
+        min_worker_port=min_worker_port,
+        max_worker_port=max_worker_port,
+    )
     typer.echo(f"ray head address for workers: {node_ip}:{port}")
     typer.echo(
         "worker command: "
-        f"gaz cluster worker --head {node_ip}:{port} --config {config} --auto"
+        + _ray_worker_command_hint(
+            head=f"{node_ip}:{port}",
+            config=config,
+            ray_port_args=ray_port_args,
+            include_node_ip_placeholder=not sys.platform.startswith("linux"),
+        )
     )
     try:
         import ray  # type: ignore[import-not-found]
@@ -710,6 +846,7 @@ def cluster_head(
                 f"--port={port}",
                 "--include-dashboard=false",
                 "--disable-usage-stats",
+                *ray_port_args,
             ],
             check=True,
             env=ray_env,
@@ -741,6 +878,63 @@ def cluster_worker(
             help="Worker LAN IP. Use 0.0.0.0 to auto-detect.",
         ),
     ] = "0.0.0.0",
+    node_manager_port: Annotated[
+        int | None,
+        typer.Option("--node-manager-port", min=1, max=65535, help="Fixed Ray node manager port."),
+    ] = None,
+    object_manager_port: Annotated[
+        int | None,
+        typer.Option(
+            "--object-manager-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray object manager port.",
+        ),
+    ] = None,
+    runtime_env_agent_port: Annotated[
+        int | None,
+        typer.Option(
+            "--runtime-env-agent-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray runtime env agent port.",
+        ),
+    ] = None,
+    dashboard_agent_listen_port: Annotated[
+        int | None,
+        typer.Option(
+            "--dashboard-agent-listen-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray dashboard agent HTTP port.",
+        ),
+    ] = None,
+    dashboard_agent_grpc_port: Annotated[
+        int | None,
+        typer.Option(
+            "--dashboard-agent-grpc-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray dashboard agent gRPC port.",
+        ),
+    ] = None,
+    metrics_export_port: Annotated[
+        int | None,
+        typer.Option(
+            "--metrics-export-port",
+            min=1,
+            max=65535,
+            help="Fixed Ray metrics export port.",
+        ),
+    ] = None,
+    min_worker_port: Annotated[
+        int | None,
+        typer.Option("--min-worker-port", min=1, max=65535, help="First fixed Ray worker port."),
+    ] = None,
+    max_worker_port: Annotated[
+        int | None,
+        typer.Option("--max-worker-port", min=1, max=65535, help="Last fixed Ray worker port."),
+    ] = None,
     auto: Annotated[bool, typer.Option("--auto", help="Register worker capabilities.")] = False,
 ) -> None:
     """Connect a worker to a Ray head."""
@@ -750,6 +944,16 @@ def cluster_worker(
     platform_warning = _ray_cluster_platform_warning()
     if platform_warning is not None:
         typer.echo(platform_warning)
+    ray_port_args = _ray_port_args(
+        node_manager_port=node_manager_port,
+        object_manager_port=object_manager_port,
+        runtime_env_agent_port=runtime_env_agent_port,
+        dashboard_agent_listen_port=dashboard_agent_listen_port,
+        dashboard_agent_grpc_port=dashboard_agent_grpc_port,
+        metrics_export_port=metrics_export_port,
+        min_worker_port=min_worker_port,
+        max_worker_port=max_worker_port,
+    )
     try:
         import ray  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
@@ -769,6 +973,8 @@ def cluster_worker(
                 "start",
                 f"--address={head}",
                 f"--node-ip-address={resolved_node_ip}",
+                "--disable-usage-stats",
+                *ray_port_args,
             ],
             check=True,
             env=ray_env,

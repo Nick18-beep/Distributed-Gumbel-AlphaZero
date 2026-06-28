@@ -36,24 +36,37 @@ Python supportato: 3.11, 3.12, 3.13. Python 3.14 non e' supportato per ora.
 Ray e' opzionale e sta dietro `ExecutionBackend`. Il trainer resta sul master/head;
 i worker generano self-play replay shard e li inviano al master.
 
-Prerequisiti su ogni macchina:
+Comandi gia' compilati per il setup corrente:
 
-```bash
-cd Distributed-Gumbel-AlphaZero
-python --version
-uv sync --extra cpu --extra distributed
+```text
+master Windows/GPU: 192.168.1.12
+worker macOS CPU:   192.168.1.161
+Ray head port:      6379
+Ray fixed ports:    6380-6386, 10002-10101
 ```
 
-Sul master con GPU usare invece:
+Prima di partire, assicurarsi che firewall e rete permettano TCP tra worker e
+master su `6379`, `6380-6386` e `10002-10101`.
+
+### 0. Setup ambiente
+
+Master Windows/GPU:
 
 ```bash
+cd "D:\nicol\Distributed Gumbel AlphaZero"
 python scripts/bootstrap.py --profile cuda --profile distributed
 uv run --extra cuda --extra distributed gaz doctor --cuda --distributed
 ```
 
-### 1. Master/head
+Worker macOS:
 
-Aprire il primo terminale sul master. Su Windows PowerShell:
+```bash
+cd /Users/nicolo/Desktop/Distributed-Gumbel-AlphaZero
+uv sync --extra cpu --extra distributed
+uv run --extra cpu --extra distributed gaz doctor --distributed
+```
+
+### 1. Master terminale 1: Ray head
 
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
@@ -63,66 +76,55 @@ uv run --extra cuda --extra distributed gaz cluster head `
   --config configs/connect_four_lan.yaml `
   --host 0.0.0.0 `
   --port 6379 `
+  --node-manager-port 6380 `
+  --object-manager-port 6381 `
+  --runtime-env-agent-port 6382 `
+  --dashboard-agent-listen-port 6384 `
+  --dashboard-agent-grpc-port 6385 `
+  --metrics-export-port 6386 `
+  --min-worker-port 10002 `
+  --max-worker-port 10101 `
   --wait-workers `
   --min-workers 1
 ```
 
-Se il master non deve usare GPU, sostituire `--extra cuda` con `--extra cpu`.
+Lasciare aperto questo terminale: stampa quando il worker si collega.
 
-Il comando stampa l'indirizzo da usare sui worker, per esempio:
-
-```text
-ray head address for workers: 192.168.1.12:6379
-```
-
-Lasciare questo terminale aperto.
-
-### 2. Worker
-
-Su un worker Linux/WSL2:
-
-```bash
-cd /path/to/Distributed-Gumbel-AlphaZero
-ray stop --force
-
-uv run --extra cpu --extra distributed gaz cluster worker \
-  --head 192.168.1.12:6379 \
-  --config configs/connect_four_lan.yaml \
-  --auto
-```
-
-Su un worker macOS:
+### 2. Worker macOS
 
 ```bash
 cd /Users/nicolo/Desktop/Distributed-Gumbel-AlphaZero
 ray stop --force
 export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
-MAC_IP=$(ipconfig getifaddr en0)
 
-uv run --extra cpu --extra distributed gaz cluster worker \
-  --head 192.168.1.12:6379 \
-  --node-ip "$MAC_IP" \
-  --config configs/connect_four_lan.yaml \
-  --auto
-```
-
-Se `MAC_IP` e' vuoto, usare l'IP LAN manuale:
-
-```bash
 uv run --extra cpu --extra distributed gaz cluster worker \
   --head 192.168.1.12:6379 \
   --node-ip 192.168.1.161 \
   --config configs/connect_four_lan.yaml \
+  --node-manager-port 6380 \
+  --object-manager-port 6381 \
+  --runtime-env-agent-port 6382 \
+  --dashboard-agent-listen-port 6384 \
+  --dashboard-agent-grpc-port 6385 \
+  --metrics-export-port 6386 \
+  --min-worker-port 10002 \
+  --max-worker-port 10101 \
   --auto
 ```
 
-Su Windows/macOS la CLI imposta automaticamente
-`RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1` per i comandi Ray multi-node.
+Se il worker va ancora in timeout, provare prima la connettivita' base dal Mac:
 
-### 3. Training distribuito
+```bash
+nc -vz 192.168.1.12 6379
+nc -vz 192.168.1.12 6380
+nc -vz 192.168.1.12 6381
+```
 
-Quando il terminale master mostra che i worker richiesti sono connessi, aprire un
-secondo terminale sul master:
+Se queste porte non rispondono, il problema e' firewall/rete prima del codice.
+
+### 3. Master terminale 2: training distribuito
+
+Eseguire questo comando solo dopo che il terminale 1 mostra il worker connesso.
 
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
@@ -133,12 +135,9 @@ uv run --extra cuda --extra distributed gaz run `
   --set cluster.head_address=192.168.1.12:6379
 ```
 
-Sostituire `192.168.1.12:6379` con l'indirizzo stampato dal comando head.
-Se il master non usa GPU, usare `--extra cpu`.
+### 4. Status e stop
 
-### 4. Verifica e stop
-
-Controllare lo stato del cluster dal master:
+Status dal master:
 
 ```powershell
 uv run --extra cuda --extra distributed gaz cluster status --head 192.168.1.12:6379
@@ -157,6 +156,10 @@ Worker Linux/macOS:
 ```bash
 ray stop --force
 ```
+
+Per worker Linux/WSL2 usare lo stesso comando worker macOS, cambiando solo
+`--node-ip` con l'IP LAN del worker Linux oppure omettendo `--node-ip` se
+l'auto-detect rileva l'interfaccia corretta.
 
 ## Comandi principali
 

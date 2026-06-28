@@ -289,6 +289,14 @@ def test_ray_cluster_env_enables_experimental_non_linux_multinode(
     assert env["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
 
 
+def test_ray_port_args_require_complete_worker_range() -> None:
+    with pytest.raises(cli_main.typer.BadParameter, match="must be set together"):
+        cli_main._ray_port_args(min_worker_port=10002)
+
+    with pytest.raises(cli_main.typer.BadParameter, match="cannot be greater"):
+        cli_main._ray_port_args(min_worker_port=10101, max_worker_port=10002)
+
+
 def test_cluster_worker_passes_non_linux_ray_multinode_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -330,8 +338,76 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
         "start",
         "--address=192.168.1.12:6379",
         "--node-ip-address=192.168.1.161",
+        "--disable-usage-stats",
     ]
     assert calls[0]["env"]["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
+
+
+def test_cluster_worker_passes_fixed_ray_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ray":
+            return object()
+        return real_import(name, globals, locals, fromlist, level)
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "worker",
+            "--head",
+            "192.168.1.12:6379",
+            "--node-ip",
+            "192.168.1.161",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "connect_four_lan.yaml"),
+            "--node-manager-port",
+            "6380",
+            "--object-manager-port",
+            "6381",
+            "--runtime-env-agent-port",
+            "6382",
+            "--dashboard-agent-listen-port",
+            "6384",
+            "--dashboard-agent-grpc-port",
+            "6385",
+            "--metrics-export-port",
+            "6386",
+            "--min-worker-port",
+            "10002",
+            "--max-worker-port",
+            "10101",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["command"] == [
+        "ray",
+        "start",
+        "--address=192.168.1.12:6379",
+        "--node-ip-address=192.168.1.161",
+        "--disable-usage-stats",
+        "--node-manager-port=6380",
+        "--object-manager-port=6381",
+        "--runtime-env-agent-port=6382",
+        "--dashboard-agent-listen-port=6384",
+        "--dashboard-agent-grpc-port=6385",
+        "--metrics-export-port=6386",
+        "--min-worker-port=10002",
+        "--max-worker-port=10101",
+    ]
 
 
 def test_cluster_head_wait_workers_uses_resolved_lan_address(
@@ -369,7 +445,7 @@ def test_cluster_head_wait_workers_uses_resolved_lan_address(
             "--host",
             "0.0.0.0",
             "--port",
-            "6380",
+            "6379",
             "--wait-workers",
             "--min-workers",
             "2",
@@ -377,27 +453,56 @@ def test_cluster_head_wait_workers_uses_resolved_lan_address(
             "10",
             "--poll-sec",
             "0.5",
+            "--node-manager-port",
+            "6380",
+            "--object-manager-port",
+            "6381",
+            "--runtime-env-agent-port",
+            "6382",
+            "--dashboard-agent-listen-port",
+            "6384",
+            "--dashboard-agent-grpc-port",
+            "6385",
+            "--metrics-export-port",
+            "6386",
+            "--min-worker-port",
+            "10002",
+            "--max-worker-port",
+            "10101",
         ],
     )
 
     assert result.exit_code == 0
-    assert "ray head address for workers: 192.168.1.12:6380" in result.output
+    assert "ray head address for workers: 192.168.1.12:6379" in result.output
     assert (
-        "worker command: gaz cluster worker --head 192.168.1.12:6380"
+        "worker command: gaz cluster worker --head 192.168.1.12:6379"
         in result.output
     )
+    assert "--node-ip WORKER_LAN_IP" in result.output
+    assert "configs/connect_four_lan.yaml" in result.output
+    assert "configs\\connect_four_lan.yaml" not in result.output
+    assert "--metrics-export-port=6386" in result.output
+    assert "--min-worker-port=10002" in result.output
     assert calls[0]["command"] == [
         "ray",
         "start",
         "--head",
         "--node-ip-address=192.168.1.12",
-        "--port=6380",
+        "--port=6379",
         "--include-dashboard=false",
         "--disable-usage-stats",
+        "--node-manager-port=6380",
+        "--object-manager-port=6381",
+        "--runtime-env-agent-port=6382",
+        "--dashboard-agent-listen-port=6384",
+        "--dashboard-agent-grpc-port=6385",
+        "--metrics-export-port=6386",
+        "--min-worker-port=10002",
+        "--max-worker-port=10101",
     ]
     assert waits == [
         {
-            "head": "192.168.1.12:6380",
+            "head": "192.168.1.12:6379",
             "min_workers": 2,
             "timeout_sec": 10.0,
             "poll_sec": 0.5,
