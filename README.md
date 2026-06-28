@@ -47,6 +47,8 @@ Ray fixed ports:    6380-6386, 10002-10101
 
 Prima di partire, assicurarsi che firewall e rete permettano TCP tra worker e
 master su `6379`, `6380-6386` e `10002-10101`.
+Se un avvio Ray fallito lascia porte occupate, il comando segnala quali porte
+sono in uso: fermare Ray con `gaz cluster stop` e ripartire.
 
 ### 0. Setup ambiente
 
@@ -70,7 +72,7 @@ uv run --extra cpu --extra distributed gaz doctor --distributed
 
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
-.\.venv\Scripts\ray.exe stop --force
+uv run --extra cuda --extra distributed gaz cluster stop
 
 uv run --extra cuda --extra distributed gaz cluster head `
   --config configs/connect_four_lan.yaml `
@@ -94,7 +96,7 @@ Lasciare aperto questo terminale: stampa quando il worker si collega.
 
 ```bash
 cd /Users/nicolo/Desktop/Distributed-Gumbel-AlphaZero
-ray stop --force
+uv run --extra cpu --extra distributed gaz cluster stop
 export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
 
 uv run --extra cpu --extra distributed gaz cluster worker \
@@ -148,13 +150,13 @@ Fermare Ray quando il training e' concluso.
 Master Windows:
 
 ```powershell
-.\.venv\Scripts\ray.exe stop --force
+uv run --extra cuda --extra distributed gaz cluster stop
 ```
 
 Worker Linux/macOS:
 
 ```bash
-ray stop --force
+uv run --extra cpu --extra distributed gaz cluster stop
 ```
 
 Per worker Linux/WSL2 usare lo stesso comando worker macOS, cambiando solo

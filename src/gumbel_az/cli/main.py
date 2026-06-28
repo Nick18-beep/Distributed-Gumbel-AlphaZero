@@ -180,6 +180,57 @@ def _ray_port_args(
     return args
 
 
+def _ray_fixed_ports(
+    *,
+    head_port: int | None = None,
+    node_manager_port: int | None = None,
+    object_manager_port: int | None = None,
+    runtime_env_agent_port: int | None = None,
+    dashboard_agent_listen_port: int | None = None,
+    dashboard_agent_grpc_port: int | None = None,
+    metrics_export_port: int | None = None,
+    min_worker_port: int | None = None,
+    max_worker_port: int | None = None,
+) -> list[int]:
+    ports = [
+        port
+        for port in (
+            head_port,
+            node_manager_port,
+            object_manager_port,
+            runtime_env_agent_port,
+            dashboard_agent_listen_port,
+            dashboard_agent_grpc_port,
+            metrics_export_port,
+        )
+        if port is not None
+    ]
+    if min_worker_port is not None and max_worker_port is not None:
+        ports.extend(range(min_worker_port, max_worker_port + 1))
+    return sorted(set(ports))
+
+
+def _is_local_tcp_port_available(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+def _ensure_local_ray_ports_available(ports: list[int]) -> None:
+    unavailable = [port for port in ports if not _is_local_tcp_port_available(port)]
+    if unavailable:
+        formatted = ", ".join(str(port) for port in unavailable)
+        typer.echo(
+            "Cannot start Ray because local TCP port(s) are already in use: "
+            f"{formatted}. Stop stale Ray processes with `gaz cluster stop` and retry.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
 def _ray_worker_command_hint(
     *,
     head: str,
@@ -203,9 +254,60 @@ def _ray_worker_command_hint(
 
 def _ray_cluster_env() -> dict[str, str]:
     env = os.environ.copy()
+    env.setdefault("RAY_raylet_start_wait_time_s", "60")
     if sys.platform in {"win32", "darwin"}:
         env.setdefault("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", "1")
     return env
+
+
+def _cleanup_failed_ray_start(ray_env: dict[str, str]) -> None:
+    try:
+        subprocess.run(
+            [_ray_cli_path(), "stop", "--force"],
+            check=False,
+            env=ray_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, RuntimeError):
+        return
+    _cleanup_ray_orphan_processes()
+
+
+def _cleanup_ray_orphan_processes() -> int:
+    if sys.platform != "win32":
+        return 0
+
+    ray_package_path = Path(sys.prefix) / "Lib" / "site-packages" / "ray"
+    env = os.environ.copy()
+    env["GAZ_RAY_ORPHAN_NEEDLE"] = str(ray_package_path)
+    script = r"""
+$needle = [Environment]::GetEnvironmentVariable('GAZ_RAY_ORPHAN_NEEDLE')
+$count = 0
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -and $_.CommandLine -like "*$needle*" } |
+  ForEach-Object {
+    try {
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+      $count += 1
+    } catch {}
+  }
+Write-Output $count
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            check=False,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, RuntimeError):
+        return 0
+    try:
+        return int(result.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return 0
 
 
 def _ray_cluster_platform_warning() -> str | None:
@@ -816,6 +918,19 @@ def cluster_head(
         min_worker_port=min_worker_port,
         max_worker_port=max_worker_port,
     )
+    _ensure_local_ray_ports_available(
+        _ray_fixed_ports(
+            head_port=port,
+            node_manager_port=node_manager_port,
+            object_manager_port=object_manager_port,
+            runtime_env_agent_port=runtime_env_agent_port,
+            dashboard_agent_listen_port=dashboard_agent_listen_port,
+            dashboard_agent_grpc_port=dashboard_agent_grpc_port,
+            metrics_export_port=metrics_export_port,
+            min_worker_port=min_worker_port,
+            max_worker_port=max_worker_port,
+        )
+    )
     typer.echo(f"ray head address for workers: {node_ip}:{port}")
     typer.echo(
         "worker command: "
@@ -852,6 +967,7 @@ def cluster_head(
             env=ray_env,
         )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        _cleanup_failed_ray_start(ray_env)
         typer.echo(f"Cannot start Ray head: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"ray head ready: {node_ip}:{port}")
@@ -954,6 +1070,18 @@ def cluster_worker(
         min_worker_port=min_worker_port,
         max_worker_port=max_worker_port,
     )
+    _ensure_local_ray_ports_available(
+        _ray_fixed_ports(
+            node_manager_port=node_manager_port,
+            object_manager_port=object_manager_port,
+            runtime_env_agent_port=runtime_env_agent_port,
+            dashboard_agent_listen_port=dashboard_agent_listen_port,
+            dashboard_agent_grpc_port=dashboard_agent_grpc_port,
+            metrics_export_port=metrics_export_port,
+            min_worker_port=min_worker_port,
+            max_worker_port=max_worker_port,
+        )
+    )
     try:
         import ray  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
@@ -980,6 +1108,7 @@ def cluster_worker(
             env=ray_env,
         )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        _cleanup_failed_ray_start(ray_env)
         typer.echo(f"Cannot start Ray worker: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     if auto:
@@ -1048,6 +1177,34 @@ def cluster_status(
         typer.echo(f"Cannot query Ray status: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(result.stdout.strip())
+
+
+@cluster_app.command("stop")
+def cluster_stop(
+    cleanup_orphans: Annotated[
+        bool,
+        typer.Option(
+            "--cleanup-orphans/--no-cleanup-orphans",
+            help="On Windows, stop Ray Python agent processes left behind by ray stop.",
+        ),
+    ] = True,
+) -> None:
+    """Stop local Ray processes and clean up Ray agents left by failed starts."""
+    ray_env = _ray_cluster_env()
+    try:
+        result = subprocess.run(
+            [_ray_cli_path(), "stop", "--force"],
+            check=False,
+            env=ray_env,
+        )
+    except (OSError, RuntimeError) as exc:
+        typer.echo(f"Cannot stop Ray: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    orphan_count = _cleanup_ray_orphan_processes() if cleanup_orphans else 0
+    if result.returncode != 0:
+        typer.echo(f"ray stop exited with code {result.returncode}", err=True)
+        raise typer.Exit(code=result.returncode)
+    typer.echo(f"ray stopped; cleaned orphan process(es): {orphan_count}")
 
 
 def main() -> None:

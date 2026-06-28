@@ -282,11 +282,22 @@ def test_ray_cluster_env_enables_experimental_non_linux_multinode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", raising=False)
+    monkeypatch.delenv("RAY_raylet_start_wait_time_s", raising=False)
     monkeypatch.setattr(cli_main.sys, "platform", "darwin")
 
     env = cli_main._ray_cluster_env()
 
     assert env["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
+    assert env["RAY_raylet_start_wait_time_s"] == "60"
+
+
+def test_ray_fixed_ports_expands_worker_range() -> None:
+    assert cli_main._ray_fixed_ports(
+        head_port=6379,
+        node_manager_port=6380,
+        min_worker_port=10002,
+        max_worker_port=10004,
+    ) == [6379, 6380, 10002, 10003, 10004]
 
 
 def test_ray_port_args_require_complete_worker_range() -> None:
@@ -295,6 +306,55 @@ def test_ray_port_args_require_complete_worker_range() -> None:
 
     with pytest.raises(cli_main.typer.BadParameter, match="cannot be greater"):
         cli_main._ray_port_args(min_worker_port=10101, max_worker_port=10002)
+
+
+def test_cluster_head_reports_busy_ports_before_ray_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ray":
+            return object()
+        return real_import(name, globals, locals, fromlist, level)
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main, "_detect_lan_ip", lambda: "192.168.1.12")
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        cli_main,
+        "_is_local_tcp_port_available",
+        lambda port: port not in {6385, 6386},
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "head",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "connect_four_lan.yaml"),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "6379",
+            "--dashboard-agent-grpc-port",
+            "6385",
+            "--metrics-export-port",
+            "6386",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "local TCP port(s) are already in use: 6385, 6386" in result.output
+    assert "gaz cluster stop" in result.output
+    assert calls == []
 
 
 def test_cluster_worker_passes_non_linux_ray_multinode_env(
@@ -317,6 +377,7 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
     monkeypatch.setattr(cli_main, "_detect_lan_ip", lambda: "192.168.1.161")
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
 
     result = runner.invoke(
         app,
@@ -361,6 +422,7 @@ def test_cluster_worker_passes_fixed_ray_ports(
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
 
     result = runner.invoke(
         app,
@@ -410,6 +472,47 @@ def test_cluster_worker_passes_fixed_ray_ports(
     ]
 
 
+def test_cluster_worker_cleans_up_after_ray_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ray":
+            return object()
+        return real_import(name, globals, locals, fromlist, level)
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["ray", "start"]:
+            raise subprocess.CalledProcessError(1, command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "worker",
+            "--head",
+            "192.168.1.12:6379",
+            "--node-ip",
+            "192.168.1.161",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "connect_four_lan.yaml"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert calls[0][:2] == ["ray", "start"]
+    assert calls[1] == ["ray", "stop", "--force"]
+
+
 def test_cluster_head_wait_workers_uses_resolved_lan_address(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,6 +537,7 @@ def test_cluster_head_wait_workers_uses_resolved_lan_address(
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
     monkeypatch.setattr(cli_main, "_wait_for_ray_workers", fake_wait)
+    monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
 
     result = runner.invoke(
         app,
@@ -541,6 +645,26 @@ def test_cluster_wait_passes_parameters_to_worker_watcher(
             "poll_sec": 0.25,
         }
     ]
+
+
+def test_cluster_stop_runs_ray_stop_and_orphan_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "_cleanup_ray_orphan_processes", lambda: 2)
+
+    result = runner.invoke(app, ["cluster", "stop"])
+
+    assert result.exit_code == 0
+    assert calls == [["ray", "stop", "--force"]]
+    assert "ray stopped; cleaned orphan process(es): 2" in result.output
 
 
 def test_config_command_accepts_override() -> None:
