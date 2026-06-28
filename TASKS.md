@@ -286,18 +286,18 @@ come sostituita dal corrispondente task PyTorch:
 
 ## Fase 12 â€” SearchBackend
 
-- [X] Verificare quali parti sono giÃ  coperte da `mctx` prima di implementare search custom.
+- [X] Verificare quali parti sono coperte dal backend PyTorch prima di estendere la search custom.
 - [X] Definire `SearchBackend` protocol.
 - [X] Definire `SearchOutput`.
 - [X] Implementare action masking utility.
 - [X] Implementare Q transform utility.
 - [X] Implementare Sequential Halving utility.
-- [X] Integrare backend `mctx`.
-- [X] Usare `mctx.gumbel_muzero_policy` quando disponibile nell'API installata.
-- [X] Creare `MctxSearchBackend`.
-- [X] Implementare root preparation batchata per `mctx`.
-- [X] Implementare recurrent function compatibile con JIT.
-- [X] Evitare loop Python per simulazioni interne nel path caldo.
+- [X] Integrare backend `torch_gumbel`.
+- [X] Usare policy/value PyTorch batchate come sorgente della search.
+- [X] Creare `TorchGumbelSearchBackend`.
+- [X] Implementare root preparation batchata per `torch_gumbel`.
+- [X] Implementare recurrent/evaluation path compatibile con PyTorch eager/compile.
+- [X] Ridurre loop Python e conversioni host/device nel path caldo.
 - [X] Fare smoke test su stato Connect Four.
 - [X] Verificare illegal action probability zero.
 - [X] Verificare determinismo con seed.

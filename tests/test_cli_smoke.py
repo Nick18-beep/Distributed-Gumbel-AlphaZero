@@ -306,6 +306,7 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+    monkeypatch.setattr(cli_main, "_detect_lan_ip", lambda: "192.168.1.161")
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
 
@@ -323,7 +324,13 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
 
     assert result.exit_code == 0
     assert "Ray multi-node on macOS is experimental" in result.output
-    assert calls[0]["command"] == ["ray", "start", "--address=192.168.1.12:6379"]
+    assert "ray worker connected: 192.168.1.12:6379 from 192.168.1.161" in result.output
+    assert calls[0]["command"] == [
+        "ray",
+        "start",
+        "--address=192.168.1.12:6379",
+        "--node-ip-address=192.168.1.161",
+    ]
     assert calls[0]["env"]["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
 
 

@@ -734,10 +734,18 @@ def cluster_worker(
     head: Annotated[str, typer.Option("--head", help="Ray head address host:port.")],
     config: ConfigOption,
     overrides: OverridesOption = None,
+    node_ip: Annotated[
+        str,
+        typer.Option(
+            "--node-ip",
+            help="Worker LAN IP. Use 0.0.0.0 to auto-detect.",
+        ),
+    ] = "0.0.0.0",
     auto: Annotated[bool, typer.Option("--auto", help="Register worker capabilities.")] = False,
 ) -> None:
     """Connect a worker to a Ray head."""
     _validate_config(config, overrides)
+    resolved_node_ip = _ray_node_ip(node_ip)
     ray_env = _ray_cluster_env()
     platform_warning = _ray_cluster_platform_warning()
     if platform_warning is not None:
@@ -756,7 +764,12 @@ def cluster_worker(
 
     try:
         subprocess.run(
-            [_ray_cli_path(), "start", f"--address={head}"],
+            [
+                _ray_cli_path(),
+                "start",
+                f"--address={head}",
+                f"--node-ip-address={resolved_node_ip}",
+            ],
             check=True,
             env=ray_env,
         )
@@ -767,7 +780,7 @@ def cluster_worker(
         capabilities = detect_worker_capabilities()
         typer.echo(json.dumps(capabilities.__dict__, sort_keys=True))
     else:
-        typer.echo(f"ray worker connected: {head}")
+        typer.echo(f"ray worker connected: {head} from {resolved_node_ip}")
 
 
 @cluster_app.command("wait")
