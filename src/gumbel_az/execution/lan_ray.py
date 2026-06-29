@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -25,6 +26,7 @@ from gumbel_az.orchestration.run import RunOrchestrator
 from gumbel_az.runtime import detect_runtime_backend
 from gumbel_az.storage import create_run_directory
 from gumbel_az.storage.atomic import atomic_write_json
+from gumbel_az.storage.filesystem import RunPaths, existing_run_paths
 from gumbel_az.storage.transfer import CheckpointSync, ReplayTransfer
 
 
@@ -36,6 +38,8 @@ def _lan_progress_message(record: dict[str, Any]) -> str | None:
         return "[lan_ray] training lifecycle starting on head node"
     if event == "lan_ray_no_remote_workers":
         return "[lan_ray] no remote workers available; using head self-play"
+    if event == "lan_ray_remote_selfplay_skipped":
+        return f"[lan_ray] remote self-play skipped: {record.get('reason')}"
     if event == "lan_ray_remote_selfplay_scheduled":
         return (
             "[lan_ray] scheduled remote self-play: "
@@ -275,6 +279,8 @@ class WorkerActorCore:
         games: int,
         seed: int,
         worker_slot: int = 0,
+        device: str | None = None,
+        checkpoint_payload_bytes: bytes | None = None,
     ) -> dict[str, Any]:
         config = AppConfig.model_validate(config_data)
         if work_dir is None:
@@ -287,12 +293,13 @@ class WorkerActorCore:
             raise RuntimeError(runtime.reason)
         import torch
 
+        selected_device = torch.device(device or runtime.device)
         torch_threads = max(1, int(os.environ.get("GAZ_RAY_ACTOR_TORCH_THREADS", "1")))
         torch.set_num_threads(torch_threads)
         print(
             "[gaz-worker] self-play starting "
             f"worker={self.capabilities.worker_id} "
-            f"slot={worker_slot} games={games} device={runtime.device} "
+            f"slot={worker_slot} games={games} device={selected_device} "
             f"torch_threads={torch_threads}",
             flush=True,
         )
@@ -302,8 +309,16 @@ class WorkerActorCore:
         worker = SelfPlayWorker(
             config,
             replay_writer=ReplayWriter(replay_dir),
-            device=runtime.device,
+            device=selected_device,
         )
+        if checkpoint_payload_bytes is not None:
+            checkpoint = torch.load(
+                BytesIO(checkpoint_payload_bytes),
+                map_location=selected_device,
+                weights_only=False,
+            )
+            worker.model.load_state_dict(checkpoint["state"]["model_state_dict"])
+            worker.model_version = int(checkpoint.get("metadata", {}).get("version", 0))
         _, result = worker.play_batch(games, seed)
         shard_path = Path(result.replay_shard)
         print(
@@ -317,7 +332,7 @@ class WorkerActorCore:
             "worker_id": self.capabilities.worker_id,
             "worker_slot": worker_slot,
             "runtime_backend": runtime.name,
-            "device": runtime.device,
+            "device": str(selected_device),
             "replay_shard": result.replay_shard,
             "replay_shard_name": shard_path.name,
             "replay_shard_bytes": shard_path.read_bytes(),
@@ -377,6 +392,24 @@ def _remote_ray_nodes(ray: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _selfplay_ray_nodes(ray: Any, *, include_head: bool) -> list[tuple[dict[str, Any], bool]]:
+    alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+    current_node_id = _current_ray_node_id(ray, alive_nodes)
+    if current_node_id is None:
+        return []
+    head_node: dict[str, Any] | None = None
+    remote_nodes: list[tuple[dict[str, Any], bool]] = []
+    for node in alive_nodes:
+        is_head = str(node.get("NodeID", "")) == current_node_id
+        if is_head:
+            head_node = node
+            continue
+        remote_nodes.append((node, False))
+    if include_head and head_node is not None and "Resources" in head_node:
+        remote_nodes.append((head_node, True))
+    return remote_nodes
+
+
 def _ray_node_affinity_options(node_id: str) -> dict[str, Any]:
     try:
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -412,6 +445,17 @@ def _ray_node_cpu_count(node: dict[str, Any]) -> int:
         return 1
 
 
+def _checkpoint_payload_bytes(run_dir: Path) -> bytes | None:
+    latest = run_dir / "checkpoints" / "latest.json"
+    if not latest.exists():
+        return None
+    pointer = json.loads(latest.read_text(encoding="utf-8"))
+    checkpoint_file = Path(pointer["path"]) / "checkpoint.pt"
+    if not checkpoint_file.exists():
+        return None
+    return checkpoint_file.read_bytes()
+
+
 class LanRayExecutionBackend:
     """Run the training lifecycle after connecting to a Ray LAN cluster."""
 
@@ -422,22 +466,48 @@ class LanRayExecutionBackend:
             raise ValueError(
                 f"LanRayExecutionBackend cannot run backend {config.execution.backend!r}"
             )
-        _enable_ray_experimental_multinode_if_needed()
-        ray = _require_ray()
         paths = create_run_directory(config)
         save_resolved_config(config, paths.run_dir)
+        return self._run_with_paths(config, paths, resume=False)
+
+    def resume(self, config: AppConfig, run_dir: Path) -> ExecutionResult:
+        if config.execution.backend != self.name:
+            raise ValueError(
+                f"LanRayExecutionBackend cannot run backend {config.execution.backend!r}"
+            )
+        paths = existing_run_paths(run_dir)
+        save_resolved_config(config, paths.run_dir)
+        return self._run_with_paths(config, paths, resume=True)
+
+    def _run_with_paths(
+        self,
+        config: AppConfig,
+        paths: RunPaths,
+        *,
+        resume: bool,
+    ) -> ExecutionResult:
+        _enable_ray_experimental_multinode_if_needed()
+        ray = _require_ray()
         event_writer = ConsoleEventWriter(paths.events_path)
         metric_writer = MetricWriter(paths.metrics_path)
         if not ray.is_initialized():
             address = config.cluster.head_address or "auto"
             ray.init(address=address, ignore_reinit_error=True)
         runtime_backend = detect_runtime_backend()
+        previous_state: dict[str, Any] = {}
+        if resume and paths.run_state_path.exists():
+            try:
+                previous_state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous_state = {}
         state = {
+            **previous_state,
             "run_id": paths.run_id,
             "backend": self.name,
             "status": "initializing",
             "cluster_head_address": config.cluster.head_address,
             "config_path": str(paths.resolved_config_path),
+            "resumed_from_checkpoint": resume,
         }
         atomic_write_json(paths.run_state_path, state)
         event_writer.write({"event": "lan_ray_initialized", **state})
@@ -455,6 +525,7 @@ class LanRayExecutionBackend:
             }
         )
         remote_nodes = _remote_ray_nodes(ray)
+        actor_nodes = _selfplay_ray_nodes(ray, include_head=bool(remote_nodes))
         remote_stats = {
             "remote_workers_available": len(remote_nodes),
             "remote_workers_scheduled": 0,
@@ -464,30 +535,37 @@ class LanRayExecutionBackend:
             "remote_positions": 0,
             "remote_replay_samples_imported": 0,
         }
-        if remote_nodes:
-            games = min(
-                config.stop.max_games or config.selfplay.games_per_iteration,
-                config.selfplay.games_per_iteration,
+        games = 0
+        if actor_nodes:
+            max_iterations = config.stop.max_iterations or 1
+            total_game_budget = config.stop.max_games or (
+                config.selfplay.games_per_iteration * max_iterations
             )
+            previous_games_seen = int(previous_state.get("games_seen", 0)) if resume else 0
+            remaining_game_budget = max(0, total_game_budget - previous_games_seen)
+            games = min(remaining_game_budget, config.selfplay.games_per_iteration)
+        if actor_nodes and games > 0:
             worker_actor = make_ray_worker_actor()
-            node_actor_counts: list[tuple[dict[str, Any], int]] = []
+            node_actor_counts: list[tuple[dict[str, Any], bool, int]] = []
             remaining_actor_budget = games
-            for node in remote_nodes:
+            for node, is_head in actor_nodes:
                 if remaining_actor_budget <= 0:
                     break
-                actor_count = min(_ray_node_cpu_count(node), remaining_actor_budget)
-                node_actor_counts.append((node, actor_count))
+                node_cpu_count = _ray_node_cpu_count(node)
+                usable_cpus = max(1, node_cpu_count - 2) if is_head else node_cpu_count
+                actor_count = min(usable_cpus, remaining_actor_budget)
+                node_actor_counts.append((node, is_head, actor_count))
                 remaining_actor_budget -= actor_count
-            actor_plan: list[tuple[dict[str, Any], int, int]] = []
+            actor_plan: list[tuple[dict[str, Any], bool, int, int]] = []
             slot = 0
-            total_actors = sum(actor_count for _, actor_count in node_actor_counts)
+            total_actors = sum(actor_count for _, _, actor_count in node_actor_counts)
             base_games_per_actor = games // total_actors
             extra_games = games % total_actors
-            for node, actor_count in node_actor_counts:
+            for node, is_head, actor_count in node_actor_counts:
                 node_games = 0
                 for _ in range(actor_count):
                     actor_games = base_games_per_actor + (1 if slot < extra_games else 0)
-                    actor_plan.append((node, slot, actor_games))
+                    actor_plan.append((node, is_head, slot, actor_games))
                     node_games += actor_games
                     slot += 1
                 event_writer.write(
@@ -495,6 +573,7 @@ class LanRayExecutionBackend:
                         "event": "lan_ray_remote_selfplay_scheduled",
                         "ray_node_id": str(node.get("NodeID", "")),
                         "ray_node_address": _ray_node_address(node),
+                        "is_head_node": is_head,
                         "actors": actor_count,
                         "games": node_games,
                         "cpu_count": _ray_node_cpu_count(node),
@@ -502,13 +581,18 @@ class LanRayExecutionBackend:
                 )
             remote_stats["remote_workers_scheduled"] = len(actor_plan)
             actors = []
-            for node, _, _ in actor_plan:
+            for node, _, _, _ in actor_plan:
                 node_id = str(node.get("NodeID", ""))
                 actors.append(
                     worker_actor.options(
                         **_ray_node_affinity_options(node_id),
                         num_cpus=1,
                     ).remote()
+                )
+            checkpoint_payload = _checkpoint_payload_bytes(paths.run_dir) if resume else None
+            if checkpoint_payload is None and resume:
+                raise RuntimeError(
+                    f"cannot resume {paths.run_dir}: latest checkpoint payload not found"
                 )
             futures = [
                 actor.generate_replay_shard.remote(
@@ -517,8 +601,10 @@ class LanRayExecutionBackend:
                     games=actor_games,
                     worker_slot=worker_slot,
                     seed=config.run.seed + 100_000 + index * 10_000,
+                    device="cpu" if is_head else None,
+                    checkpoint_payload_bytes=checkpoint_payload,
                 )
-                for index, (actor, (_, worker_slot, actor_games)) in enumerate(
+                for index, (actor, (_, is_head, worker_slot, actor_games)) in enumerate(
                     zip(actors, actor_plan, strict=True)
                 )
                 if actor_games > 0
@@ -545,9 +631,12 @@ class LanRayExecutionBackend:
                 shard_path.write_bytes(payload.pop("replay_shard_bytes"))
                 imported = head.upload_replay_shard(payload["worker_id"], str(shard_path))
                 remote_stats["remote_workers_completed"] += 1
-                remote_stats["remote_games"] += int(payload.get("games", 0))
-                remote_stats["remote_positions"] += int(payload.get("positions", 0))
-                remote_stats["remote_replay_samples_imported"] += int(imported.get("samples", 0))
+                if imported.get("imported"):
+                    remote_stats["remote_games"] += int(payload.get("games", 0))
+                    remote_stats["remote_positions"] += int(payload.get("positions", 0))
+                    remote_stats["remote_replay_samples_imported"] += int(
+                        imported.get("samples", 0)
+                    )
                 event_writer.write(
                     {
                         "event": "lan_ray_remote_selfplay_completed",
@@ -557,12 +646,21 @@ class LanRayExecutionBackend:
                         "imported": imported,
                     }
                 )
-        else:
+        elif not actor_nodes:
             event_writer.write(
                 {
                     "event": "lan_ray_no_remote_workers",
                     "run_id": paths.run_id,
                     "note": "No remote Ray worker nodes were available; using head self-play.",
+                }
+            )
+        else:
+            event_writer.write(
+                {
+                    "event": "lan_ray_remote_selfplay_skipped",
+                    "run_id": paths.run_id,
+                    "reason": "max_games_reached",
+                    "remote_workers_available": len(remote_nodes),
                 }
             )
         state.update(remote_stats)
@@ -573,10 +671,8 @@ class LanRayExecutionBackend:
             runtime_backend=runtime_backend,
             event_writer=event_writer,
             metric_writer=metric_writer,
-            skip_initial_selfplay_if_replay_available=remote_stats[
-                "remote_replay_samples_imported"
-            ]
-            > 0,
+            skip_initial_selfplay_if_replay_available=False,
+            resume=resume,
         ).run()
         if paths.run_state_path.exists():
             final_state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))

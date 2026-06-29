@@ -32,6 +32,7 @@ class RunOrchestrator:
         event_writer: JsonlWriter,
         metric_writer: MetricWriter,
         skip_initial_selfplay_if_replay_available: bool = False,
+        resume: bool = False,
     ) -> None:
         self.config = config
         self.paths = paths
@@ -39,6 +40,7 @@ class RunOrchestrator:
         self.event_writer = event_writer
         self.metric_writer = metric_writer
         self.skip_initial_selfplay_if_replay_available = skip_initial_selfplay_if_replay_available
+        self.resume = resume
 
     def _write_state(self, **updates: Any) -> dict[str, Any]:
         previous: dict[str, Any] = {}
@@ -107,14 +109,23 @@ class RunOrchestrator:
 
     def run(self) -> ExecutionResult:
         started = perf_counter()
+        previous_state: dict[str, Any] = {}
+        if self.paths.run_state_path.exists():
+            try:
+                previous_state = json.loads(self.paths.run_state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous_state = {}
         self._write_state(
             status="running",
-            created_at=_utc_now(),
+            created_at=previous_state.get("created_at", _utc_now()),
             config_path=str(self.paths.resolved_config_path),
-            train_step=0,
-            games_seen=0,
-            samples_seen=0,
-            iterations_completed=0,
+            resumed_from_checkpoint=bool(self.resume),
+            train_step=int(previous_state.get("train_step", 0)) if self.resume else 0,
+            games_seen=int(previous_state.get("games_seen", 0)) if self.resume else 0,
+            samples_seen=int(previous_state.get("samples_seen", 0)) if self.resume else 0,
+            iterations_completed=int(previous_state.get("iterations_completed", 0))
+            if self.resume
+            else 0,
         )
 
         try:
@@ -153,6 +164,22 @@ class RunOrchestrator:
                 checkpoint_manager=checkpoint_manager,
                 metric_writer=self.metric_writer,
             )
+            if self.resume:
+                try:
+                    checkpoint = checkpoint_manager.load(map_location=trainer.device)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"cannot resume {self.paths.run_dir}: latest checkpoint not found"
+                    ) from exc
+                trainer.load_checkpoint(checkpoint)
+                metadata = checkpoint.get("metadata", {})
+                self.event_writer.write(
+                    {
+                        "event": "checkpoint_loaded_for_resume",
+                        "checkpoint_version": metadata.get("version", trainer.state.step),
+                        "train_step": int(trainer.state.step),
+                    }
+                )
             scheduler = LocalScheduler(self.config)
             selfplay_worker = SelfPlayWorker(
                 self.config,
@@ -160,11 +187,28 @@ class RunOrchestrator:
                 model=trainer.state.model,
                 device=self.runtime_backend.device,
             )
+            selfplay_worker.model_version = int(trainer.state.step)
 
-            for iteration in range(max_iterations):
+            total_games = (
+                int(previous_state.get("games_seen", 0))
+                if self.resume
+                else int(previous_state.get("remote_games", 0))
+            )
+            total_positions = (
+                int(previous_state.get("samples_seen", 0))
+                if self.resume
+                else int(previous_state.get("remote_positions", 0))
+            )
+            iterations_completed = (
+                int(previous_state.get("iterations_completed", 0)) if self.resume else 0
+            )
+            iteration_offset = iterations_completed if self.resume else 0
+
+            for local_iteration in range(max_iterations):
+                iteration = iteration_offset + local_iteration
                 if self.config.stop.max_wall_time_sec is not None:
                     elapsed = perf_counter() - started
-                    if iteration > 0 and elapsed >= self.config.stop.max_wall_time_sec:
+                    if local_iteration > 0 and elapsed >= self.config.stop.max_wall_time_sec:
                         break
                 if self.config.stop.max_train_steps is not None:
                     if int(trainer.state.step) >= self.config.stop.max_train_steps:
@@ -189,16 +233,29 @@ class RunOrchestrator:
                     }
                 )
                 remaining_games = None
+                skip_selfplay_for_game_limit = False
                 if self.config.stop.max_games is not None:
                     remaining_games = self.config.stop.max_games - total_games
                     if remaining_games <= 0:
-                        break
+                        if replay_samples_available > 0:
+                            skip_selfplay_for_game_limit = True
+                        else:
+                            break
                 skip_selfplay = (
                     self.skip_initial_selfplay_if_replay_available
                     and iteration == 0
                     and replay_samples_available > 0
                 )
-                if decision.allow_selfplay and skip_selfplay:
+                if decision.allow_selfplay and skip_selfplay_for_game_limit:
+                    self.event_writer.write(
+                        {
+                            "event": "selfplay_skipped",
+                            "iteration": iteration,
+                            "reason": "max_games_reached_existing_replay_available",
+                            "replay_samples_available": replay_samples_available,
+                        }
+                    )
+                elif decision.allow_selfplay and skip_selfplay:
                     self.event_writer.write(
                         {
                             "event": "selfplay_skipped",
@@ -213,6 +270,7 @@ class RunOrchestrator:
                         self.config.selfplay.games_per_iteration,
                     )
                     selfplay_worker.model = trainer.state.model
+                    selfplay_worker.model_version = int(trainer.state.step)
                     selfplay_result = self._run_selfplay(
                         iteration=iteration,
                         games_to_generate=games_to_generate,
@@ -328,6 +386,28 @@ class RunOrchestrator:
                 )
 
             if latest_train_result is None:
+                if self.resume:
+                    self.event_writer.write(
+                        {
+                            "event": "resume_no_training_needed",
+                            "train_step": int(trainer.state.step),
+                        }
+                    )
+                    self._write_state(
+                        status="completed",
+                        train_step=int(trainer.state.step),
+                        games_seen=total_games,
+                        samples_seen=total_positions,
+                        replay_shard=latest_replay_shard,
+                        checkpoint_version=int(trainer.state.step),
+                        iterations_completed=iterations_completed,
+                        eval=latest_eval_payload,
+                    )
+                    return ExecutionResult(
+                        run_id=self.paths.run_id,
+                        run_dir=self.paths.run_dir,
+                        status="completed",
+                    )
                 raise RuntimeError("run stopped before completing a training iteration")
 
             self._write_state(

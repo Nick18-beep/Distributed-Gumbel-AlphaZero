@@ -904,7 +904,7 @@ def test_local_multiprocess_unknown_algorithm_reports_clean_error(
     assert "Traceback" not in result.output
 
 
-def test_resume_reports_not_implemented(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resume_status_only_reports_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     run_dir = Path("run")
     run_dir.mkdir()
@@ -917,7 +917,7 @@ def test_resume_reports_not_implemented(tmp_path: Path, monkeypatch: pytest.Monk
         encoding="utf-8",
     )
 
-    result = runner.invoke(app, ["resume", str(run_dir)])
+    result = runner.invoke(app, ["resume", str(run_dir), "--status-only"])
 
     assert result.exit_code == 0
     assert "resume state:" in result.output

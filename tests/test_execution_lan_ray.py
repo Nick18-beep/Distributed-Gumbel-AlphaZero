@@ -9,6 +9,7 @@ import pytest
 
 import gumbel_az.execution.lan_ray as lan_ray_module
 from gumbel_az.config import load_config
+from gumbel_az.execution import SingleProcessExecutionBackend
 from gumbel_az.execution.heartbeat import HeartbeatRegistry
 from gumbel_az.execution.lan_ray import (
     ConsoleEventWriter,
@@ -408,6 +409,117 @@ def test_lan_ray_backend_runs_training_after_cluster_init(
     assert '"event": "training_completed"' in events
 
 
+def test_lan_ray_resume_preserves_state_and_continues_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+    initial = SingleProcessExecutionBackend().run(initial_config)
+    fake_ray = _FakeRay()
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    resume_config = load_config(
+        initial.run_dir / "config.resolved.yaml",
+        [
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=2",
+            "stop.max_iterations=1",
+            "stop.max_train_steps=2",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().resume(resume_config, initial.run_dir)
+
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    latest = json.loads(
+        (result.run_dir / "checkpoints" / "latest.json").read_text(encoding="utf-8")
+    )
+    events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    assert result.run_dir == initial.run_dir
+    assert state["status"] == "completed"
+    assert state["train_step"] == 2
+    assert state["resumed_from_checkpoint"] is True
+    assert latest["version"] == 2
+    assert '"event": "checkpoint_loaded_for_resume"' in events
+
+
+def test_lan_ray_resume_does_not_schedule_remote_selfplay_without_game_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+    initial = SingleProcessExecutionBackend().run(initial_config)
+    fake_ray = _FakeRayWithRemoteWorkers(
+        [
+            {"Alive": True, "NodeID": "head-node", "NodeManagerAddress": "192.168.1.12"},
+            {"Alive": True, "NodeID": "mac-worker", "NodeManagerAddress": "192.168.1.161"},
+        ]
+    )
+    worker_factory = _FakeWorkerActorFactory([])
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    monkeypatch.setattr(lan_ray_module, "make_ray_worker_actor", lambda: worker_factory)
+    resume_config = load_config(
+        initial.run_dir / "config.resolved.yaml",
+        [
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=8",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "stop.max_train_steps=2",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().resume(resume_config, initial.run_dir)
+
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    assert result.status == "completed"
+    assert state["train_step"] == 2
+    assert state["games_seen"] == 1
+    assert state["remote_workers_scheduled"] == 0
+    assert worker_factory.options_calls == []
+    assert '"event": "lan_ray_remote_selfplay_skipped"' in events
+    assert '"event": "lan_ray_no_remote_workers"' not in events
+
+
 def test_lan_ray_backend_continues_when_one_remote_worker_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -485,6 +597,73 @@ def test_lan_ray_backend_continues_when_one_remote_worker_fails(
         {"test_node_id": "mac-worker", "num_cpus": 1},
         {"test_node_id": "win-worker", "num_cpus": 1},
     ]
+
+
+def test_lan_ray_backend_does_not_count_corrupt_remote_replay_as_games(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_ray = _FakeRayWithRemoteWorkers(
+        [
+            {"Alive": True, "NodeID": "head-node", "NodeManagerAddress": "192.168.1.12"},
+            {"Alive": True, "NodeID": "mac-worker", "NodeManagerAddress": "192.168.1.161"},
+        ]
+    )
+    worker_factory = _FakeWorkerActorFactory(
+        [
+            {
+                "worker_id": "mac-worker",
+                "runtime_backend": "torch",
+                "device": "cpu",
+                "replay_shard": "/tmp/worker/shard_000000001.msgpack.zst",
+                "replay_shard_name": "shard_000000001.msgpack.zst",
+                "replay_shard_bytes": b"not-a-valid-shard",
+                "games": 1,
+                "positions": 1,
+                "games_per_sec": 1.0,
+                "positions_per_sec": 1.0,
+            },
+        ]
+    )
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    monkeypatch.setattr(lan_ray_module, "make_ray_worker_actor", lambda: worker_factory)
+    monkeypatch.setattr(
+        lan_ray_module,
+        "_ray_node_affinity_options",
+        lambda node_id: {"test_node_id": node_id},
+    )
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=1",
+            "selfplay.batch_size=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "replay.min_samples_to_train=1",
+            "replay.low_watermark=1",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().run(config)
+
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    assert result.status == "completed"
+    assert state["remote_workers_completed"] == 1
+    assert state["remote_replay_samples_imported"] == 0
+    assert state["remote_games"] == 0
+    assert state["games_seen"] == 1
+    assert '"event": "selfplay_completed"' in events
 
 
 def test_lan_ray_backend_uses_remote_node_cpu_slots(
@@ -565,4 +744,85 @@ def test_lan_ray_backend_uses_remote_node_cpu_slots(
         {"test_node_id": "mac-worker", "num_cpus": 1},
         {"test_node_id": "mac-worker", "num_cpus": 1},
         {"test_node_id": "mac-worker", "num_cpus": 1},
+    ]
+
+
+def test_lan_ray_backend_uses_head_cpu_slots_after_remote_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_ray = _FakeRayWithRemoteWorkers(
+        [
+            {
+                "Alive": True,
+                "NodeID": "head-node",
+                "NodeManagerAddress": "192.168.1.12",
+                "Resources": {"CPU": 4.0},
+            },
+            {
+                "Alive": True,
+                "NodeID": "mac-worker",
+                "NodeManagerAddress": "192.168.1.161",
+                "Resources": {"CPU": 1.0},
+            },
+        ]
+    )
+    worker_factory = _FakeWorkerActorFactory(
+        [
+            {
+                "worker_id": f"worker-{index}",
+                "worker_slot": index,
+                "runtime_backend": "torch",
+                "device": "cpu",
+                "replay_shard": "/tmp/worker/shard_000000001.msgpack.zst",
+                "replay_shard_name": f"shard_{index:09d}.msgpack.zst",
+                "replay_shard_bytes": _encoded_sample_shard(),
+                "games": 1,
+                "positions": 1,
+                "games_per_sec": 1.0,
+                "positions_per_sec": 1.0,
+            }
+            for index in range(3)
+        ]
+    )
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    monkeypatch.setattr(lan_ray_module, "make_ray_worker_actor", lambda: worker_factory)
+    monkeypatch.setattr(
+        lan_ray_module,
+        "_ray_node_affinity_options",
+        lambda node_id: {"test_node_id": node_id},
+    )
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=3",
+            "selfplay.batch_size=1",
+            "stop.max_games=3",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "replay.min_samples_to_train=1",
+            "replay.low_watermark=1",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().run(config)
+
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert result.status == "completed"
+    assert state["remote_workers_scheduled"] == 3
+    assert state["remote_games"] == 3
+    assert state["games_seen"] == 3
+    assert worker_factory.options_calls == [
+        {"test_node_id": "mac-worker", "num_cpus": 1},
+        {"test_node_id": "head-node", "num_cpus": 1},
+        {"test_node_id": "head-node", "num_cpus": 1},
     ]

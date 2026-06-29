@@ -13,7 +13,8 @@ class WarmupCosineSchedule:
     def __init__(self, config: TrainingConfig) -> None:
         self.base_lr = config.learning_rate
         self.warmup_steps = max(0, config.warmup_steps)
-        self.total_steps = max(config.steps_per_iteration, self.warmup_steps + 1)
+        total_steps = config.total_steps or config.steps_per_iteration
+        self.total_steps = max(total_steps, self.warmup_steps + 1)
 
     def __call__(self, step: int) -> float:
         step = max(0, int(step))

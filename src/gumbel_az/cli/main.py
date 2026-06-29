@@ -555,6 +555,8 @@ def resume(
             help="Run directory to resume.",
         ),
     ],
+    overrides: OverridesOption = None,
+    execution: ExecutionOption = None,
     rebuild_replay_index: Annotated[
         bool,
         typer.Option(
@@ -562,8 +564,13 @@ def resume(
             help="Rebuild replay/index.json from valid local shards before reporting resume state.",
         ),
     ] = False,
+    status_only: Annotated[
+        bool,
+        typer.Option("--status-only", help="Only report resume state without continuing training."),
+    ] = False,
 ) -> None:
     """Resume an existing run."""
+    _reject_checkpoint_shape_overrides(overrides)
     try:
         context = load_resume_context(run_dir, rebuild_replay=rebuild_replay_index)
     except (OSError, ValueError) as exc:
@@ -581,6 +588,34 @@ def resume(
         f"replay_samples={context.replay_index.get('total_samples', 0)} "
         f"latest_checkpoint={latest_version}"
     )
+    if status_only:
+        return
+    execution_override = None if execution is None else f"execution.backend={execution}"
+    app_config = _validate_config(
+        run_dir / "config.resolved.yaml",
+        _append_override(overrides, execution_override),
+    )
+    try:
+        if app_config.execution.backend == "single_process":
+            result = SingleProcessExecutionBackend().resume(app_config, run_dir)
+        elif app_config.execution.backend == "lan_ray":
+            from gumbel_az.execution.lan_ray import LanRayExecutionBackend
+
+            result = LanRayExecutionBackend().resume(app_config, run_dir)
+        elif app_config.execution.backend == "local_multiprocess":
+            typer.echo(
+                "local_multiprocess resume is not implemented; use single_process or lan_ray."
+            )
+            raise typer.Exit(code=1)
+        else:
+            _not_implemented(
+                f"gaz resume with execution backend {app_config.execution.backend}",
+                "resume execution",
+            )
+    except (KeyError, ValueError, RuntimeError, NotImplementedError, TimeoutError) as exc:
+        typer.echo(f"Resume failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"run {result.status}: {result.run_dir}")
 
 
 @app.command()

@@ -8,7 +8,7 @@ from gumbel_az.config import load_config
 from gumbel_az.envs import create_game
 from gumbel_az.model import create_network
 from gumbel_az.model.checkpoint import CheckpointManager
-from gumbel_az.model.optimizer import create_optimizer
+from gumbel_az.model.optimizer import WarmupCosineSchedule, create_optimizer
 from gumbel_az.replay import ReplayReader, ReplayWriter
 from gumbel_az.training import TorchTrainState, train_step
 from gumbel_az.training.trainer import (
@@ -71,6 +71,24 @@ def test_train_step_is_finite_and_updates_params() -> None:
         for key, value in model.state_dict().items()
         if value.dtype.is_floating_point
     )
+
+
+def test_warmup_cosine_schedule_uses_global_total_steps() -> None:
+    short_config = load_config(CONFIG, ["training.steps_per_iteration=10"])
+    long_config = load_config(
+        CONFIG,
+        [
+            "training.steps_per_iteration=10",
+            "training.total_steps=100",
+        ],
+    )
+
+    short_schedule = WarmupCosineSchedule(short_config.training)
+    long_schedule = WarmupCosineSchedule(long_config.training)
+
+    assert short_schedule(10) == 0.0
+    assert long_schedule(10) > 0.0
+    assert long_schedule(100) == 0.0
 
 
 def test_compile_auto_keeps_cpu_debug_eager() -> None:

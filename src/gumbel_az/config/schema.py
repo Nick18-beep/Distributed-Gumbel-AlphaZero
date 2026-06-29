@@ -106,6 +106,7 @@ class ReplayConfig(StrictBaseModel):
 class TrainingConfig(StrictBaseModel):
     batch_size: PositiveInt
     steps_per_iteration: PositiveInt
+    total_steps: PositiveInt | None = None
     optimizer: Literal["adamw"]
     learning_rate: PositiveFloat
     weight_decay: float = Field(ge=0.0)

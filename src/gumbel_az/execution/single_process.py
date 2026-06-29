@@ -9,6 +9,7 @@ from gumbel_az.logging import JsonlWriter, MetricWriter
 from gumbel_az.orchestration.run import RunOrchestrator
 from gumbel_az.runtime import detect_runtime_backend
 from gumbel_az.storage import create_run_directory
+from gumbel_az.storage.filesystem import existing_run_paths
 
 
 class SingleProcessExecutionBackend:
@@ -34,4 +35,24 @@ class SingleProcessExecutionBackend:
             runtime_backend=runtime_backend,
             event_writer=event_writer,
             metric_writer=metric_writer,
+        ).run()
+
+    def resume(self, config: AppConfig, run_dir) -> ExecutionResult:
+        if config.execution.backend != self.name:
+            raise ValueError(
+                f"SingleProcessExecutionBackend cannot run backend {config.execution.backend!r}"
+            )
+        paths = existing_run_paths(run_dir)
+        save_resolved_config(config, paths.run_dir)
+        event_writer = JsonlWriter(paths.events_path)
+        metric_writer = MetricWriter(paths.metrics_path)
+        event_writer.write({"event": "run_resumed", "run_id": paths.run_id})
+        runtime_backend = detect_runtime_backend()
+        return RunOrchestrator(
+            config,
+            paths=paths,
+            runtime_backend=runtime_backend,
+            event_writer=event_writer,
+            metric_writer=metric_writer,
+            resume=True,
         ).run()

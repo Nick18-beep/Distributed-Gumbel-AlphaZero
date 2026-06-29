@@ -55,6 +55,7 @@ replay:
 training:
   batch_size: 512
   steps_per_iteration: 200
+  total_steps: 200000
   optimizer: adamw
   learning_rate: 0.001
   weight_decay: 0.0001
@@ -66,7 +67,7 @@ eval:
   promotion_win_rate: 0.55
 
 stop:
-  max_iterations: null
-  max_train_steps: null
-  max_games: null
+  max_iterations: 200
+  max_train_steps: 200000
+  max_games: 102400
   max_wall_time_sec: null

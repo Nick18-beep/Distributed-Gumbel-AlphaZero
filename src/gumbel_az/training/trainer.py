@@ -90,6 +90,12 @@ def _compiled_original_model(model: torch.nn.Module) -> torch.nn.Module | None:
     return original if isinstance(original, torch.nn.Module) else None
 
 
+def _load_model_state_dict(model: torch.nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    original = _compiled_original_model(model)
+    target = original if original is not None else model
+    target.load_state_dict(state_dict)
+
+
 class Trainer:
     def __init__(
         self,
@@ -133,6 +139,20 @@ class Trainer:
             compile_enabled=compile_mode == "compiled",
             compile_mode=compile_mode,
         )
+
+    def load_checkpoint(self, checkpoint: dict) -> None:
+        state = checkpoint.get("state", {})
+        model_state = state.get("model_state_dict")
+        if not isinstance(model_state, dict):
+            raise ValueError("checkpoint is missing model_state_dict")
+        _load_model_state_dict(self.state.model, model_state)
+        optimizer_state = state.get("optimizer_state_dict")
+        if isinstance(optimizer_state, dict):
+            self.state.optimizer.load_state_dict(optimizer_state)
+        scaler_state = state.get("scaler_state_dict")
+        if self.state.scaler is not None and isinstance(scaler_state, dict):
+            self.state.scaler.load_state_dict(scaler_state)
+        self.state.step = int(state.get("step", checkpoint.get("metadata", {}).get("version", 0)))
 
     def _fallback_state_to_eager(self, state: TorchTrainState) -> TorchTrainState:
         original = _compiled_original_model(state.model)

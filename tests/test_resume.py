@@ -40,6 +40,112 @@ def test_resume_context_loads_run_state_config_replay_and_checkpoint(tmp_path: P
     assert context.best_checkpoint is not None
 
 
+def test_single_process_resume_continues_latest_checkpoint_in_same_run_dir(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+    first = SingleProcessExecutionBackend().run(config)
+    resumed_config = load_config(
+        first.run_dir / "config.resolved.yaml",
+        [
+            "stop.max_games=2",
+            "stop.max_iterations=1",
+            "stop.max_train_steps=2",
+        ],
+    )
+
+    second = SingleProcessExecutionBackend().resume(resumed_config, first.run_dir)
+    context = load_resume_context(first.run_dir)
+
+    assert second.run_dir == first.run_dir
+    assert context.run_state["status"] == "completed"
+    assert context.run_state["train_step"] == 2
+    assert context.latest_checkpoint is not None
+    assert context.latest_checkpoint["version"] == 2
+
+
+def test_resume_trains_from_existing_replay_when_max_games_is_reached(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+    first = SingleProcessExecutionBackend().run(config)
+    resumed_config = load_config(
+        first.run_dir / "config.resolved.yaml",
+        [
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "stop.max_train_steps=2",
+        ],
+    )
+
+    second = SingleProcessExecutionBackend().resume(resumed_config, first.run_dir)
+    context = load_resume_context(first.run_dir)
+    events = (first.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+
+    assert second.status == "completed"
+    assert context.run_state["train_step"] == 2
+    assert context.run_state["games_seen"] == 1
+    assert "max_games_reached_existing_replay_available" in events
+
+
+def test_resume_noops_when_stop_limits_are_already_satisfied(tmp_path: Path) -> None:
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+    first = SingleProcessExecutionBackend().run(config)
+    resumed_config = load_config(first.run_dir / "config.resolved.yaml")
+
+    second = SingleProcessExecutionBackend().resume(resumed_config, first.run_dir)
+    context = load_resume_context(first.run_dir)
+    events = (first.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+
+    assert second.status == "completed"
+    assert context.run_state["train_step"] == 1
+    assert context.latest_checkpoint is not None
+    assert context.latest_checkpoint["version"] == 1
+    assert "resume_no_training_needed" in events
+
+
 def test_rebuild_replay_index_quarantines_corrupted_shards(tmp_path: Path) -> None:
     config = load_config(DEBUG_CONFIG)
     run_dir = tmp_path / "run"

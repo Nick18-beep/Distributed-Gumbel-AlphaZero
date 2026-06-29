@@ -21,6 +21,16 @@ def _network_apply(observation):
     )
 
 
+def _illegal_favoring_network_apply(observation):
+    batch_size = observation.shape[0]
+    logits = torch.zeros((batch_size, COLUMNS), dtype=torch.float32, device=observation.device)
+    logits[:, -1] = 1000.0
+    return NetworkOutput(
+        policy_logits=logits,
+        value=torch.zeros((batch_size,), dtype=torch.float32, device=observation.device),
+    )
+
+
 def test_torch_gumbel_search_masks_illegal_actions_and_is_deterministic() -> None:
     config = load_config(CONFIG)
     game = ConnectFourGame()
@@ -57,6 +67,37 @@ def test_torch_gumbel_search_masks_illegal_actions_and_is_deterministic() -> Non
     assert torch.allclose(output_a.policy_target.sum(dim=-1), torch.ones(2))
     assert torch.equal(output_a.selected_action, output_b.selected_action)
     assert torch.allclose(output_a.policy_target, output_b.policy_target)
+
+
+def test_torch_gumbel_mcts_respects_root_legal_mask_over_game_mask() -> None:
+    config = load_config(
+        CONFIG,
+        [
+            "search.simulations_per_move=32",
+            "search.max_num_considered_actions=7",
+            "search.gumbel_scale=0.0",
+        ],
+    )
+    game = ConnectFourGame()
+    state = game.init()
+    observation = torch.as_tensor(game.canonical_observation(state)[None, ...])
+    legal_mask = torch.as_tensor(game.legal_action_mask(state)[None, ...])
+    legal_mask[:, -1] = False
+    backend = TorchGumbelSearchBackend(game=game)
+
+    output = backend.search(
+        root_observation=observation,
+        root_legal_mask=legal_mask,
+        network_apply=_illegal_favoring_network_apply,
+        rng=torch.Generator().manual_seed(0),
+        config=config.search,
+        root_embedding=[state],
+    )
+
+    assert output.selected_action.item() != COLUMNS - 1
+    assert output.policy_target[0, -1] == 0.0
+    assert output.visit_counts[0, -1] == 0.0
+    assert output.q_values[0, -1] == 0.0
 
 
 def test_masked_policy_assigns_zero_to_illegal_actions() -> None:

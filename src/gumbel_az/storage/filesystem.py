@@ -53,3 +53,16 @@ def create_run_directory(config: AppConfig, *, base_dir: Path | None = None) -> 
         },
     )
     return paths
+
+
+def existing_run_paths(run_dir: Path) -> RunPaths:
+    run_dir = run_dir.resolve()
+    return RunPaths(
+        run_id=run_dir.name,
+        run_dir=run_dir,
+        logs_dir=run_dir / "logs",
+        events_path=run_dir / "logs" / "events.jsonl",
+        metrics_path=run_dir / "logs" / "metrics.jsonl",
+        run_state_path=run_dir / "run_state.json",
+        resolved_config_path=run_dir / "config.resolved.yaml",
+    )

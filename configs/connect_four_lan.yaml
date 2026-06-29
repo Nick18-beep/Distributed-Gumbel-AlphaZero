@@ -41,7 +41,7 @@ model:
   blocks: 4
 
 selfplay:
-  games_per_iteration: 256
+  games_per_iteration: 4096
   batch_size: 128
   temperature_moves: 12
   shard_max_samples: 4096
@@ -54,7 +54,8 @@ replay:
 
 training:
   batch_size: 256
-  steps_per_iteration: 100
+  steps_per_iteration: 500
+  total_steps: 200000
   optimizer: adamw
   learning_rate: 0.001
   weight_decay: 0.0001
@@ -62,11 +63,11 @@ training:
 
 eval:
   enabled: true
-  games: 100
+  games: 200
   promotion_win_rate: 0.55
 
 stop:
-  max_iterations: null
-  max_train_steps: null
-  max_games: null
+  max_iterations: 200
+  max_train_steps: 200000
+  max_games: 819200
   max_wall_time_sec: null
