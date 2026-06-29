@@ -89,33 +89,42 @@ Prima ferma eventuali processi Ray vecchi sul master:
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
 uv run --no-sync --extra cuda --extra distributed gaz cluster stop
+uv run --no-sync --extra cuda --extra distributed ray stop --force
 ```
 
-Poi avvia il nodo head. Lascia questo terminale aperto:
+Poi avvia il nodo head con porte fisse e CPU Ray limitate. Su Windows questo e'
+importante: se Ray vede tutte le CPU del master puo' avviare molti actor locali,
+ognuno importa PyTorch CUDA, e Windows puo' fallire con `WinError 1455` per file
+di paging troppo piccolo.
+
+Il comando avvia Ray in background e poi torna al prompt:
 
 ```powershell
-uv run --no-sync --extra cuda --extra distributed gaz cluster head `
-  --config configs/connect_four_lan.yaml `
-  --host 0.0.0.0 `
-  --port 6379 `
-  --node-manager-port 6380 `
-  --object-manager-port 6381 `
-  --runtime-env-agent-port 6382 `
-  --dashboard-agent-listen-port 6384 `
-  --dashboard-agent-grpc-port 6385 `
-  --metrics-export-port 6386 `
-  --min-worker-port 10002 `
-  --max-worker-port 10101 `
-  --wait-workers `
-  --min-workers 1
+$env:RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER="1"
+
+uv run --no-sync --extra cuda --extra distributed ray start --head `
+  --node-ip-address=192.168.1.12 `
+  --port=6379 `
+  --node-manager-port=6380 `
+  --object-manager-port=6381 `
+  --runtime-env-agent-port=6382 `
+  --dashboard-agent-listen-port=6384 `
+  --dashboard-agent-grpc-port=6385 `
+  --metrics-export-port=6386 `
+  --min-worker-port=10002 `
+  --max-worker-port=10101 `
+  --num-cpus=2 `
+  --num-gpus=1 `
+  --disable-usage-stats
 ```
 
-Il comando resta in attesa. Quando il worker si collega deve stampare una riga
-simile a:
+In un secondo terminale master puoi aspettare il worker con:
 
-```text
-required Ray workers connected: 1/1
+```powershell
+uv run --no-sync --extra cuda --extra distributed gaz cluster status --head 192.168.1.12:6379
 ```
+
+Aspetta che lo status mostri due nodi attivi prima di avviare il training.
 
 ### 2. Worker macOS
 
@@ -143,7 +152,7 @@ mkdir -p /tmp/ray-gaz /tmp/ray-gaz-spill
 uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --head 192.168.1.12:6379 \
   --node-ip 192.168.1.161 \
-  --config configs/connect_four_lan.yaml \
+  --config configs/connect_four_lan_long.yaml \
   --node-manager-port 6380 \
   --object-manager-port 6381 \
   --runtime-env-agent-port 6382 \
@@ -242,22 +251,44 @@ Active:
   ...
   ...
 Resources:
-  0.0/20.0 CPU
+  0.0/10.0 CPU
 ```
 
 ### 3. Master terminale 2: training distribuito
 
-Eseguire questo comando solo dopo che il terminale 1 mostra:
+Eseguire questo comando solo dopo che `gaz cluster status` mostra master e
+worker attivi.
 
-```text
-required Ray workers connected: 1/1
-```
+Run lungo consigliato:
 
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
 
 uv run --no-sync --extra cuda --extra distributed gaz run `
-  --config configs/connect_four_lan.yaml `
+  --config configs/connect_four_lan_long.yaml `
+  --set cluster.head_address=192.168.1.12:6379
+```
+
+Resume reale di un run interrotto:
+
+```powershell
+cd "D:\nicol\Distributed Gumbel AlphaZero"
+
+uv run --no-sync --extra cuda --extra distributed gaz resume `
+  artifacts\runs\<RUN_ID> `
+  --execution lan_ray `
+  --set cluster.head_address=192.168.1.12:6379
+```
+
+Per un test distribuito medio, piu' lungo di uno smoke test ma molto piu' corto
+della configurazione LAN completa:
+
+
+```powershell
+cd "D:\nicol\Distributed Gumbel AlphaZero"
+
+uv run --no-sync --extra cuda --extra distributed gaz run `
+  --config configs/connect_four_lan_long.yaml `
   --execution lan_ray `
   --set cluster.head_address=192.168.1.12:6379 `
   --set selfplay.games_per_iteration=64 `
@@ -272,10 +303,8 @@ uv run --no-sync --extra cuda --extra distributed gaz run `
   --set eval.games=8
 ```
 
-Questo e' un test distribuito medio: piu' lungo di uno smoke test, ma molto piu'
-corto della configurazione LAN completa. Per un run completo rimuovere gli
-override da `selfplay.games_per_iteration` in poi e lasciare solo
-`--set cluster.head_address=192.168.1.12:6379`.
+Per un run completo usare il comando "Run lungo consigliato", cioe' senza gli
+override da `selfplay.games_per_iteration` in poi.
 
 Durante il run il master stampa eventi di avanzamento come:
 
@@ -395,6 +424,9 @@ JAX, Flax, Optax, Orbax, MCTX, Chex e PGX non sono runtime attivi del progetto.
 
 - `Ray is not installed`: eseguire `uv sync --extra distributed`.
 - `torch cuda available: False`: controllare driver NVIDIA e installazione PyTorch CUDA.
+- `WinError 1455` o errori su `torch\lib\*.dll` durante la creazione degli actor:
+  fermare Ray e riavviare il master con il comando `ray start --head` sopra,
+  lasciando `--num-cpus=2` oppure abbassandolo a `--num-cpus=1`.
 - Worker macOS/Windows Ray: usare i comandi `gaz cluster ...`; la CLI imposta la variabile Ray richiesta.
 - Replay corrotto: `gaz inspect replay ...` mostra `read_errors`; gli shard corrotti vanno in `quarantine/`.
 - Checkpoint mancante: controllare `checkpoints/latest.json`, `checkpoints/best.json` e `checkpoint.pt`.

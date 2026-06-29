@@ -1,0 +1,78 @@
+run:
+  name: connect-four-lan-fast
+  seed: 42
+  output_dir: artifacts/runs
+
+execution:
+  backend: lan_ray
+
+cluster:
+  enabled: true
+  head_address: 127.0.0.1:6379
+
+install:
+  profile: distributed
+
+storage:
+  backend: filesystem
+  root: artifacts/runs
+
+logging:
+  level: INFO
+  format: jsonl
+
+game:
+  name: connect_four
+  implementation: torch
+
+algorithm:
+  name: gumbel_alphazero
+
+search:
+  backend: torch_gumbel
+  simulations_per_move: 48
+  max_num_considered_actions: 7
+  gumbel_scale: 1.0
+  q_transform: completed_by_mix_value
+
+model:
+  name: resnet_board
+  channels: 128
+  blocks: 5
+  conv_kernel_size: [3, 3]
+  policy_head_channels: 32
+  value_head_channels: 32
+  batch_norm_momentum: 0.1
+
+selfplay:
+  games_per_iteration: 256
+  batch_size: 64
+  temperature_moves: 20
+  shard_max_samples: 8192
+
+replay:
+  window_samples: 1000000
+  min_samples_to_train: 8192
+  low_watermark: 32768
+  high_watermark: 500000
+
+training:
+  batch_size: 512
+  steps_per_iteration: 250
+  total_steps: 25000
+  optimizer: adamw
+  learning_rate: 0.002
+  weight_decay: 0.0001
+  checkpoint_every_steps: 500
+  compile: "off"
+
+eval:
+  enabled: true
+  games: 128
+  promotion_win_rate: 0.55
+
+stop:
+  max_iterations: 100
+  max_train_steps: 25000
+  max_games: 25600
+  max_wall_time_sec: null
