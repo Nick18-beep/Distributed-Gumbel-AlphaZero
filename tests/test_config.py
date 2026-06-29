@@ -17,6 +17,7 @@ CONFIG_DIR = PROJECT_ROOT / "configs"
     [
         "connect_four.yaml",
         "connect_four_lan.yaml",
+        "connect_four_lan_long.yaml",
         "connect_four_cpu_debug.yaml",
         "connect_four_gpu.yaml",
     ],

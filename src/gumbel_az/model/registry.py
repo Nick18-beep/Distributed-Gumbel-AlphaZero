@@ -24,6 +24,10 @@ def create_network(config: ModelConfig, *, num_actions: int) -> NetworkFactory:
             channels=config.channels,
             blocks=config.blocks,
             num_actions=num_actions,
+            conv_kernel_size=config.conv_kernel_size or (3, 3),
+            policy_head_channels=config.policy_head_channels or 2,
+            value_head_channels=config.value_head_channels or 1,
+            batch_norm_momentum=config.batch_norm_momentum or 0.1,
         )
     available = ", ".join(registered_models())
     raise KeyError(f"unknown model {config.name!r}; available models: {available}")

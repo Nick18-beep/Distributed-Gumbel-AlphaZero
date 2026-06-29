@@ -69,11 +69,18 @@ class ModelConfig(StrictBaseModel):
     channels: PositiveInt | None = None
     blocks: PositiveInt | None = None
     hidden_size: PositiveInt | None = None
+    conv_kernel_size: tuple[PositiveInt, PositiveInt] | None = None
+    policy_head_channels: PositiveInt | None = None
+    value_head_channels: PositiveInt | None = None
+    batch_norm_momentum: float | None = Field(default=None, gt=0.0, lt=1.0)
 
     @model_validator(mode="after")
     def validate_model_parameters(self) -> ModelConfig:
         if self.name == "resnet_board" and (self.channels is None or self.blocks is None):
             raise ValueError("resnet_board requires model.channels and model.blocks")
+        if self.name == "resnet_board" and self.conv_kernel_size is not None:
+            if any(size % 2 == 0 for size in self.conv_kernel_size):
+                raise ValueError("resnet_board conv_kernel_size values must be odd")
         if self.name == "mlp_small" and self.hidden_size is None:
             raise ValueError("mlp_small requires model.hidden_size")
         return self

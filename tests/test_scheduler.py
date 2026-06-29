@@ -16,16 +16,43 @@ def test_scheduler_prioritizes_selfplay_below_low_watermark() -> None:
     assert decision.mode == "prioritize_selfplay"
     assert decision.allow_selfplay
     assert not decision.allow_training
-    assert decision.reason == "replay_below_low_watermark"
+    assert decision.reason == "replay_below_min_samples_to_train"
 
 
-def test_scheduler_allows_training_with_some_replay_below_low_watermark() -> None:
-    config = load_config(DEBUG_CONFIG)
+def test_scheduler_blocks_training_below_min_samples_to_train() -> None:
+    config = load_config(DEBUG_CONFIG, ["replay.min_samples_to_train=8"])
     decision = LocalScheduler(config).decide(SchedulerSignals(replay_samples_available=1))
 
     assert decision.mode == "prioritize_selfplay"
     assert decision.allow_selfplay
+    assert not decision.allow_training
+    assert decision.reason == "replay_below_min_samples_to_train"
+
+
+def test_scheduler_allows_training_after_min_samples_below_low_watermark() -> None:
+    config = load_config(DEBUG_CONFIG, ["replay.min_samples_to_train=8"])
+    decision = LocalScheduler(config).decide(
+        SchedulerSignals(replay_samples_available=config.replay.min_samples_to_train)
+    )
+
+    assert decision.mode == "prioritize_selfplay"
+    assert decision.allow_selfplay
     assert decision.allow_training
+    assert decision.reason == "replay_below_low_watermark"
+
+
+def test_scheduler_backpressure_does_not_train_below_min_samples() -> None:
+    config = load_config(DEBUG_CONFIG, ["replay.min_samples_to_train=8"])
+    decision = LocalScheduler(config).decide(
+        SchedulerSignals(
+            replay_samples_available=config.replay.min_samples_to_train - 1,
+            replay_write_queue_depth=2,
+        )
+    )
+
+    assert not decision.allow_selfplay
+    assert not decision.allow_training
+    assert decision.reason == "replay_write_backpressure"
 
 
 def test_scheduler_prioritizes_training_above_high_watermark() -> None:

@@ -47,7 +47,7 @@ selfplay:
 
 replay:
   window_samples: 2048
-  min_samples_to_train: 64
+  min_samples_to_train: 1
   low_watermark: 128
   high_watermark: 1024
 

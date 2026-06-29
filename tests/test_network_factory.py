@@ -41,6 +41,20 @@ def test_resnet_forward_shapes() -> None:
     assert output.value.shape == (2,)
 
 
+def test_resnet_long_preset_uses_configurable_head_channels() -> None:
+    config = load_config(CONFIG_DIR / "connect_four_lan_long.yaml")
+    game = create_game(config.game.name)
+    network = create_network(config.model, num_actions=game.num_actions)
+
+    model = network.init(1, game.observation_shape, game.num_actions)
+    output = model(torch.zeros((2, *game.observation_shape), dtype=torch.float32))
+
+    assert output.policy_logits.shape == (2, game.num_actions)
+    assert output.value.shape == (2,)
+    assert model.policy_head[0].out_channels == 32
+    assert model.value_head[0].out_channels == 32
+
+
 def test_model_init_rejects_num_actions_mismatch() -> None:
     config = load_config(CONFIG_DIR / "connect_four_cpu_debug.yaml")
     game = create_game(config.game.name)

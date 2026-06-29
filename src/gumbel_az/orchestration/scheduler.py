@@ -56,7 +56,8 @@ class LocalScheduler:
             return SchedulerDecision(
                 mode="balanced",
                 allow_selfplay=False,
-                allow_training=True,
+                allow_training=signals.replay_samples_available
+                >= replay.min_samples_to_train,
                 max_selfplay_batches_in_flight=0,
                 replay_write_queue_limit=1,
                 evaluation_games_budget=0,
@@ -64,11 +65,23 @@ class LocalScheduler:
                 reason="replay_write_backpressure",
             )
 
+        if signals.replay_samples_available < replay.min_samples_to_train:
+            return SchedulerDecision(
+                mode="prioritize_selfplay",
+                allow_selfplay=True,
+                allow_training=False,
+                max_selfplay_batches_in_flight=1,
+                replay_write_queue_limit=1,
+                evaluation_games_budget=0,
+                shard_max_samples=selfplay.shard_max_samples,
+                reason="replay_below_min_samples_to_train",
+            )
+
         if signals.replay_samples_available < replay.low_watermark:
             return SchedulerDecision(
                 mode="prioritize_selfplay",
                 allow_selfplay=True,
-                allow_training=signals.replay_samples_available > 0,
+                allow_training=True,
                 max_selfplay_batches_in_flight=1,
                 replay_write_queue_limit=1,
                 evaluation_games_budget=0,
