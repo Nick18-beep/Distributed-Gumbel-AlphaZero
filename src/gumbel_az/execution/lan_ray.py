@@ -36,6 +36,13 @@ def _lan_progress_message(record: dict[str, Any]) -> str | None:
         return "[lan_ray] training lifecycle starting on head node"
     if event == "lan_ray_no_remote_workers":
         return "[lan_ray] no remote workers available; using head self-play"
+    if event == "lan_ray_remote_selfplay_scheduled":
+        return (
+            "[lan_ray] scheduled remote self-play: "
+            f"node={record.get('ray_node_address')} "
+            f"actors={record.get('actors')} "
+            f"games={record.get('games')}"
+        )
     if event == "lan_ray_remote_selfplay_completed":
         imported = record.get("imported", {})
         return (
@@ -74,6 +81,13 @@ def _lan_progress_message(record: dict[str, Any]) -> str | None:
             f"iteration={record.get('iteration')} "
             f"games={record.get('games')} "
             f"positions={record.get('positions')}"
+        )
+    if event == "selfplay_skipped":
+        return (
+            "[run] self-play skipped: "
+            f"iteration={record.get('iteration')} "
+            f"reason={record.get('reason')} "
+            f"replay_samples={record.get('replay_samples_available')}"
         )
     if event == "training_completed":
         return (
@@ -260,16 +274,28 @@ class WorkerActorCore:
         work_dir: str | os.PathLike[str] | None = None,
         games: int,
         seed: int,
+        worker_slot: int = 0,
     ) -> dict[str, Any]:
         config = AppConfig.model_validate(config_data)
         if work_dir is None:
             root = Path(tempfile.gettempdir()) / "gumbel_az_ray_workers"
         else:
             root = Path(work_dir)
-        replay_dir = root / self.capabilities.worker_id / "replay"
+        replay_dir = root / self.capabilities.worker_id / f"slot_{worker_slot:03d}" / "replay"
         runtime = detect_runtime_backend()
         if runtime.name != "torch":
             raise RuntimeError(runtime.reason)
+        import torch
+
+        torch_threads = max(1, int(os.environ.get("GAZ_RAY_ACTOR_TORCH_THREADS", "1")))
+        torch.set_num_threads(torch_threads)
+        print(
+            "[gaz-worker] self-play starting "
+            f"worker={self.capabilities.worker_id} "
+            f"slot={worker_slot} games={games} device={runtime.device} "
+            f"torch_threads={torch_threads}",
+            flush=True,
+        )
         from gumbel_az.replay import ReplayWriter
         from gumbel_az.selfplay.worker import SelfPlayWorker
 
@@ -280,8 +306,16 @@ class WorkerActorCore:
         )
         _, result = worker.play_batch(games, seed)
         shard_path = Path(result.replay_shard)
+        print(
+            "[gaz-worker] self-play completed "
+            f"worker={self.capabilities.worker_id} "
+            f"slot={worker_slot} games={result.games} positions={result.positions} "
+            f"games_per_sec={result.games_per_sec:.3f}",
+            flush=True,
+        )
         return {
             "worker_id": self.capabilities.worker_id,
+            "worker_slot": worker_slot,
             "runtime_backend": runtime.name,
             "device": runtime.device,
             "replay_shard": result.replay_shard,
@@ -368,6 +402,16 @@ def _ray_node_address(node: dict[str, Any]) -> str:
     )
 
 
+def _ray_node_cpu_count(node: dict[str, Any]) -> int:
+    resources = node.get("Resources", {})
+    if not isinstance(resources, dict):
+        return 1
+    try:
+        return max(1, int(float(resources.get("CPU", 1))))
+    except (TypeError, ValueError):
+        return 1
+
+
 class LanRayExecutionBackend:
     """Run the training lifecycle after connecting to a Ray LAN cluster."""
 
@@ -426,26 +470,56 @@ class LanRayExecutionBackend:
                 config.selfplay.games_per_iteration,
             )
             worker_actor = make_ray_worker_actor()
-            selected_nodes = remote_nodes[: min(len(remote_nodes), games)]
-            remote_stats["remote_workers_scheduled"] = len(selected_nodes)
+            node_actor_counts: list[tuple[dict[str, Any], int]] = []
+            remaining_actor_budget = games
+            for node in remote_nodes:
+                if remaining_actor_budget <= 0:
+                    break
+                actor_count = min(_ray_node_cpu_count(node), remaining_actor_budget)
+                node_actor_counts.append((node, actor_count))
+                remaining_actor_budget -= actor_count
+            actor_plan: list[tuple[dict[str, Any], int, int]] = []
+            slot = 0
+            total_actors = sum(actor_count for _, actor_count in node_actor_counts)
+            base_games_per_actor = games // total_actors
+            extra_games = games % total_actors
+            for node, actor_count in node_actor_counts:
+                node_games = 0
+                for _ in range(actor_count):
+                    actor_games = base_games_per_actor + (1 if slot < extra_games else 0)
+                    actor_plan.append((node, slot, actor_games))
+                    node_games += actor_games
+                    slot += 1
+                event_writer.write(
+                    {
+                        "event": "lan_ray_remote_selfplay_scheduled",
+                        "ray_node_id": str(node.get("NodeID", "")),
+                        "ray_node_address": _ray_node_address(node),
+                        "actors": actor_count,
+                        "games": node_games,
+                        "cpu_count": _ray_node_cpu_count(node),
+                    }
+                )
+            remote_stats["remote_workers_scheduled"] = len(actor_plan)
             actors = []
-            for node in selected_nodes:
+            for node, _, _ in actor_plan:
                 node_id = str(node.get("NodeID", ""))
                 actors.append(
-                    worker_actor.options(**_ray_node_affinity_options(node_id)).remote()
+                    worker_actor.options(
+                        **_ray_node_affinity_options(node_id),
+                        num_cpus=1,
+                    ).remote()
                 )
-            games_per_actor = [games // len(actors)] * len(actors)
-            for index in range(games % len(actors)):
-                games_per_actor[index] += 1
             futures = [
                 actor.generate_replay_shard.remote(
                     config.model_dump(mode="json"),
                     work_dir=None,
                     games=actor_games,
+                    worker_slot=worker_slot,
                     seed=config.run.seed + 100_000 + index * 10_000,
                 )
-                for index, (actor, actor_games) in enumerate(
-                    zip(actors, games_per_actor, strict=True)
+                for index, (actor, (_, worker_slot, actor_games)) in enumerate(
+                    zip(actors, actor_plan, strict=True)
                 )
                 if actor_games > 0
             ]
@@ -453,7 +527,7 @@ class LanRayExecutionBackend:
             upload_dir = paths.run_dir / "ray_uploads"
             upload_dir.mkdir(parents=True, exist_ok=True)
             for index, future in enumerate(futures):
-                node = selected_nodes[index]
+                node = actor_plan[index][0]
                 try:
                     payload = ray.get(future)
                 except Exception as exc:
@@ -499,6 +573,10 @@ class LanRayExecutionBackend:
             runtime_backend=runtime_backend,
             event_writer=event_writer,
             metric_writer=metric_writer,
+            skip_initial_selfplay_if_replay_available=remote_stats[
+                "remote_replay_samples_imported"
+            ]
+            > 0,
         ).run()
         if paths.run_state_path.exists():
             final_state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))

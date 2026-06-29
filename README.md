@@ -162,7 +162,18 @@ uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
 
 `--keep-alive` lascia il terminale del worker attivo dopo l'avvio di Ray. La CLI
 controlla periodicamente lo stato del cluster ogni `--keep-alive-poll-sec`
-secondi e, con `Ctrl+C`, ferma il worker Ray locale.
+secondi stampando heartbeat del tipo:
+
+```text
+ray worker heartbeat: connected to 192.168.1.12:6379
+```
+
+Con `Ctrl+C`, ferma il worker Ray locale.
+
+Durante il training, il master distribuisce la self-play remota su piu' attori
+Ray per nodo, fino alle CPU dichiarate dal worker. Ogni attore usa `num_cpus=1`
+e un thread PyTorch, cosi' un Mac con 8 CPU puo' ricevere fino a 8 shard in
+parallelo se ci sono abbastanza partite da generare.
 
 Se dopo un pull compare:
 
@@ -248,13 +259,29 @@ cd "D:\nicol\Distributed Gumbel AlphaZero"
 uv run --no-sync --extra cuda --extra distributed gaz run `
   --config configs/connect_four_lan.yaml `
   --execution lan_ray `
-  --set cluster.head_address=192.168.1.12:6379
+  --set cluster.head_address=192.168.1.12:6379 `
+  --set selfplay.games_per_iteration=64 `
+  --set stop.max_games=64 `
+  --set stop.max_iterations=1 `
+  --set search.simulations_per_move=32 `
+  --set replay.min_samples_to_train=1 `
+  --set replay.low_watermark=1 `
+  --set training.steps_per_iteration=12 `
+  --set training.checkpoint_every_steps=12 `
+  --set stop.max_train_steps=12 `
+  --set eval.games=8
 ```
+
+Questo e' un test distribuito medio: piu' lungo di uno smoke test, ma molto piu'
+corto della configurazione LAN completa. Per un run completo rimuovere gli
+override da `selfplay.games_per_iteration` in poi e lasciare solo
+`--set cluster.head_address=192.168.1.12:6379`.
 
 Durante il run il master stampa eventi di avanzamento come:
 
 ```text
 [lan_ray] connected to Ray cluster: 192.168.1.12:6379
+[lan_ray] scheduled remote self-play: node=192.168.1.161 actors=... games=...
 [lan_ray] remote worker completed: worker=... imported_samples=...
 [run] scheduler: iteration=0 stage=before_training selfplay=True training=True ...
 [run] training checkpoint: iteration=0 step=...

@@ -31,12 +31,14 @@ class RunOrchestrator:
         runtime_backend: RuntimeBackend,
         event_writer: JsonlWriter,
         metric_writer: MetricWriter,
+        skip_initial_selfplay_if_replay_available: bool = False,
     ) -> None:
         self.config = config
         self.paths = paths
         self.runtime_backend = runtime_backend
         self.event_writer = event_writer
         self.metric_writer = metric_writer
+        self.skip_initial_selfplay_if_replay_available = skip_initial_selfplay_if_replay_available
 
     def _write_state(self, **updates: Any) -> dict[str, Any]:
         previous: dict[str, Any] = {}
@@ -191,7 +193,21 @@ class RunOrchestrator:
                     remaining_games = self.config.stop.max_games - total_games
                     if remaining_games <= 0:
                         break
-                if decision.allow_selfplay:
+                skip_selfplay = (
+                    self.skip_initial_selfplay_if_replay_available
+                    and iteration == 0
+                    and replay_samples_available > 0
+                )
+                if decision.allow_selfplay and skip_selfplay:
+                    self.event_writer.write(
+                        {
+                            "event": "selfplay_skipped",
+                            "iteration": iteration,
+                            "reason": "remote_replay_available",
+                            "replay_samples_available": replay_samples_available,
+                        }
+                    )
+                elif decision.allow_selfplay:
                     games_to_generate = min(
                         remaining_games or self.config.selfplay.games_per_iteration,
                         self.config.selfplay.games_per_iteration,

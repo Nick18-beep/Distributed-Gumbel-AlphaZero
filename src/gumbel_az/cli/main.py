@@ -397,6 +397,7 @@ def _keep_ray_worker_alive(*, head: str, poll_sec: float, ray_env: dict[str, str
                     env=ray_env,
                 )
                 raise typer.Exit(code=1)
+            typer.echo(f"ray worker heartbeat: connected to {head}")
     except KeyboardInterrupt:
         typer.echo("stopping local Ray worker...")
         subprocess.run(
