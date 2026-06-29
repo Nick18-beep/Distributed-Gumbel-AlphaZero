@@ -320,6 +320,23 @@ def test_ray_storage_args_are_forwarded() -> None:
     ]
 
 
+def test_ray_worker_storage_defaults_use_short_paths_on_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+
+    assert cli_main._ray_worker_storage_defaults() == (
+        Path("/tmp/ray-gaz"),
+        Path("/tmp"),
+        Path("/tmp/ray-gaz-spill"),
+    )
+    assert cli_main._ray_worker_storage_defaults(temp_dir=Path("/custom/ray")) == (
+        Path("/custom/ray"),
+        Path("/tmp"),
+        Path("/tmp/ray-gaz-spill"),
+    )
+
+
 def test_cluster_head_reports_busy_ports_before_ray_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -412,6 +429,9 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
         "--address=192.168.1.12:6379",
         "--node-ip-address=192.168.1.161",
         "--disable-usage-stats",
+        "--temp-dir=/tmp/ray-gaz",
+        "--plasma-directory=/tmp",
+        "--object-spilling-directory=/tmp/ray-gaz-spill",
     ]
     assert calls[0]["env"]["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
 
@@ -432,6 +452,7 @@ def test_cluster_worker_passes_fixed_ray_ports(
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
     monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
@@ -484,7 +505,7 @@ def test_cluster_worker_passes_fixed_ray_ports(
     ]
 
 
-def test_cluster_worker_keep_alive_can_be_enabled(
+def test_cluster_worker_keep_alive_polls_after_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
@@ -500,15 +521,15 @@ def test_cluster_worker_keep_alive_can_be_enabled(
         calls.append({"command": command, **kwargs})
         return subprocess.CompletedProcess(command, 0)
 
+    def fake_keep_alive(**kwargs) -> None:
+        keep_alive_calls.append(kwargs)
+
     monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "_keep_ray_worker_alive", fake_keep_alive)
     monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
-    monkeypatch.setattr(
-        cli_main,
-        "_keep_ray_worker_terminal_alive",
-        lambda **kwargs: keep_alive_calls.append(kwargs),
-    )
 
     result = runner.invoke(
         app,
@@ -523,18 +544,53 @@ def test_cluster_worker_keep_alive_can_be_enabled(
             str(PROJECT_ROOT / "configs" / "connect_four_lan.yaml"),
             "--keep-alive",
             "--keep-alive-poll-sec",
-            "3",
+            "10",
         ],
     )
 
     assert result.exit_code == 0
-    assert calls[0]["command"][:2] == ["ray", "start"]
+    assert calls[0]["command"] == [
+        "ray",
+        "start",
+        "--address=192.168.1.12:6379",
+        "--node-ip-address=192.168.1.161",
+        "--disable-usage-stats",
+    ]
     assert keep_alive_calls == [
         {
             "head": "192.168.1.12:6379",
-            "node_ip": "192.168.1.161",
-            "poll_sec": 3.0,
+            "poll_sec": 10.0,
+            "ray_env": calls[0]["env"],
         }
+    ]
+
+
+def test_ray_worker_keep_alive_stops_local_ray_on_status_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["ray", "status"]:
+            return subprocess.CompletedProcess(command, 1)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "sleep", lambda seconds: None)
+
+    with pytest.raises(cli_main.typer.Exit) as exc_info:
+        cli_main._keep_ray_worker_alive(
+            head="192.168.1.12:6379",
+            poll_sec=10.0,
+            ray_env={},
+        )
+
+    assert exc_info.value.exit_code == 1
+    assert calls == [
+        ["ray", "status", "--address=192.168.1.12:6379"],
+        ["ray", "stop", "--force"],
     ]
 
 

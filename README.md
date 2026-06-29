@@ -160,9 +160,23 @@ uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --auto
 ```
 
-Con `--keep-alive` il terminale worker resta aperto e stampa heartbeat periodici
-verso il cluster. Per tornare alla shell premere `Ctrl+C`; i processi Ray
-restano attivi finche' non si esegue `gaz cluster stop`.
+`--keep-alive` lascia il terminale del worker attivo dopo l'avvio di Ray. La CLI
+controlla periodicamente lo stato del cluster ogni `--keep-alive-poll-sec`
+secondi e, con `Ctrl+C`, ferma il worker Ray locale.
+
+Se dopo un pull compare:
+
+```text
+No such option: --keep-alive
+```
+
+la virtualenv sta ancora eseguendo una versione vecchia della CLI. Aggiornare
+l'ambiente e verificare che l'help mostri i flag keep-alive:
+
+```bash
+uv sync --extra cpu --extra distributed
+uv run --no-sync --extra cpu --extra distributed gaz cluster worker --help | grep keep-alive
+```
 
 Se il worker va in timeout con `RPC error: Deadline Exceeded`, controllare prima
 la connettivita' base dal Mac. Se queste porte rispondono, il master e'

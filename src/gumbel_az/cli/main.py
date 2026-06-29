@@ -196,6 +196,32 @@ def _ray_storage_args(
     return args
 
 
+def _ray_worker_storage_defaults(
+    *,
+    temp_dir: Path | None = None,
+    plasma_directory: Path | None = None,
+    object_spilling_directory: Path | None = None,
+) -> tuple[Path | None, Path | None, Path | None]:
+    if sys.platform != "darwin":
+        return temp_dir, plasma_directory, object_spilling_directory
+    return (
+        temp_dir or Path("/tmp/ray-gaz"),
+        plasma_directory or Path("/tmp"),
+        object_spilling_directory or Path("/tmp/ray-gaz-spill"),
+    )
+
+
+def _prepare_ray_storage_dirs(
+    *,
+    temp_dir: Path | None = None,
+    plasma_directory: Path | None = None,
+    object_spilling_directory: Path | None = None,
+) -> None:
+    for directory in (temp_dir, plasma_directory, object_spilling_directory):
+        if directory is not None:
+            directory.mkdir(parents=True, exist_ok=True)
+
+
 def _ray_fixed_ports(
     *,
     head_port: int | None = None,
@@ -264,7 +290,7 @@ def _ray_worker_command_hint(
     ]
     if include_node_ip_placeholder:
         command.extend(["--node-ip", "WORKER_LAN_IP"])
-    command.extend(["--config", config_path, *ray_port_args, "--auto"])
+    command.extend(["--config", config_path, *ray_port_args, "--keep-alive", "--auto"])
     return " ".join(command)
 
 
@@ -344,6 +370,43 @@ def _apply_ray_cluster_env() -> None:
     os.environ.update(_ray_cluster_env())
 
 
+def _keep_ray_worker_alive(*, head: str, poll_sec: float, ray_env: dict[str, str]) -> None:
+    typer.echo(
+        f"ray worker keep-alive active for {head}; "
+        "press Ctrl+C to stop this local Ray worker."
+    )
+    try:
+        while True:
+            sleep(poll_sec)
+            result = subprocess.run(
+                [_ray_cli_path(), "status", f"--address={head}"],
+                check=False,
+                env=ray_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode != 0:
+                typer.echo(
+                    "Ray keep-alive status check failed; "
+                    "the head or local worker may have stopped. Stopping local Ray worker.",
+                    err=True,
+                )
+                subprocess.run(
+                    [_ray_cli_path(), "stop", "--force"],
+                    check=False,
+                    env=ray_env,
+                )
+                raise typer.Exit(code=1)
+    except KeyboardInterrupt:
+        typer.echo("stopping local Ray worker...")
+        subprocess.run(
+            [_ray_cli_path(), "stop", "--force"],
+            check=False,
+            env=ray_env,
+        )
+        raise typer.Exit(code=0) from None
+
+
 def _ray_node_label(node: dict) -> str:
     address = node.get("NodeManagerAddress") or node.get("NodeManagerHostname") or "unknown"
     resources = node.get("Resources", {})
@@ -398,33 +461,6 @@ def _wait_for_ray_workers(
                 err=True,
             )
             raise typer.Exit(code=1)
-        sleep(poll_sec)
-
-
-def _keep_ray_worker_terminal_alive(
-    *,
-    head: str,
-    node_ip: str,
-    poll_sec: float,
-) -> None:
-    typer.echo(
-        "ray worker keep-alive active; leave this terminal open, "
-        "press Ctrl+C to return to the shell."
-    )
-    while True:
-        try:
-            result = subprocess.run(
-                [_ray_cli_path(), "status", f"--address={head}"],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=_ray_cluster_env(),
-            )
-        except (OSError, RuntimeError) as exc:
-            typer.echo(f"ray worker heartbeat failed: {exc}", err=True)
-            raise typer.Exit(code=1) from exc
-        status = "connected" if result.returncode == 0 else f"status_error={result.returncode}"
-        typer.echo(f"ray worker heartbeat: head={head} node_ip={node_ip} {status}")
         sleep(poll_sec)
 
 
@@ -1132,14 +1168,15 @@ def cluster_worker(
     ] = None,
     keep_alive: Annotated[
         bool,
-        typer.Option(
-            "--keep-alive",
-            help="Keep the worker terminal open and print periodic Ray heartbeats.",
-        ),
+        typer.Option("--keep-alive", help="Keep this terminal attached to the Ray worker."),
     ] = False,
     keep_alive_poll_sec: Annotated[
         float,
-        typer.Option("--keep-alive-poll-sec", min=1.0, help="Worker heartbeat interval."),
+        typer.Option(
+            "--keep-alive-poll-sec",
+            min=1.0,
+            help="Seconds between Ray status checks while --keep-alive is active.",
+        ),
     ] = 10.0,
     auto: Annotated[bool, typer.Option("--auto", help="Register worker capabilities.")] = False,
 ) -> None:
@@ -1160,7 +1197,17 @@ def cluster_worker(
         min_worker_port=min_worker_port,
         max_worker_port=max_worker_port,
     )
+    temp_dir, plasma_directory, object_spilling_directory = _ray_worker_storage_defaults(
+        temp_dir=temp_dir,
+        plasma_directory=plasma_directory,
+        object_spilling_directory=object_spilling_directory,
+    )
     ray_storage_args = _ray_storage_args(
+        temp_dir=temp_dir,
+        plasma_directory=plasma_directory,
+        object_spilling_directory=object_spilling_directory,
+    )
+    _prepare_ray_storage_dirs(
         temp_dir=temp_dir,
         plasma_directory=plasma_directory,
         object_spilling_directory=object_spilling_directory,
@@ -1213,14 +1260,7 @@ def cluster_worker(
     else:
         typer.echo(f"ray worker connected: {head} from {resolved_node_ip}")
     if keep_alive:
-        try:
-            _keep_ray_worker_terminal_alive(
-                head=head,
-                node_ip=resolved_node_ip,
-                poll_sec=keep_alive_poll_sec,
-            )
-        except KeyboardInterrupt:
-            typer.echo("ray worker keep-alive stopped; Ray processes are still running.")
+        _keep_ray_worker_alive(head=head, poll_sec=keep_alive_poll_sec, ray_env=ray_env)
 
 
 @cluster_app.command("wait")
