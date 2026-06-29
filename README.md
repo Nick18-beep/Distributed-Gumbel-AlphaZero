@@ -51,6 +51,18 @@ Se un avvio Ray fallito lascia porte occupate, il comando segnala quali porte
 sono in uso: fermare Ray con `gaz cluster stop` e ripartire.
 Dopo il bootstrap/sync iniziale, usare `uv run --no-sync` nei terminali cluster:
 evita sync concorrenti della stessa `.venv` mentre Ray e' attivo.
+Sequenza obbligatoria:
+
+```text
+1. fermare Ray su master e worker
+2. avviare Ray head sul master con porte fisse
+3. avviare Ray worker sul Mac/worker con le stesse porte fisse
+4. aspettare sul master: "required Ray workers connected: 1/1"
+5. solo dopo avviare il training dal secondo terminale master
+```
+
+Non avviare `gaz run --execution lan_ray` prima che il worker sia connesso: il
+training partirebbe solo sul master e finirebbe senza replay remoto.
 
 ### 0. Setup ambiente
 
@@ -72,10 +84,16 @@ uv run --extra cpu --extra distributed gaz doctor --distributed
 
 ### 1. Master terminale 1: Ray head
 
+Prima ferma eventuali processi Ray vecchi sul master:
+
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
 uv run --no-sync --extra cuda --extra distributed gaz cluster stop
+```
 
+Poi avvia il nodo head. Lascia questo terminale aperto:
+
+```powershell
 uv run --no-sync --extra cuda --extra distributed gaz cluster head `
   --config configs/connect_four_lan.yaml `
   --host 0.0.0.0 `
@@ -92,15 +110,28 @@ uv run --no-sync --extra cuda --extra distributed gaz cluster head `
   --min-workers 1
 ```
 
-Lasciare aperto questo terminale: stampa quando il worker si collega.
+Il comando resta in attesa. Quando il worker si collega deve stampare una riga
+simile a:
+
+```text
+required Ray workers connected: 1/1
+```
 
 ### 2. Worker macOS
+
+Prima ferma eventuali processi Ray vecchi sul worker:
 
 ```bash
 cd /Users/nicolo/Desktop/Distributed-Gumbel-AlphaZero
 uv run --no-sync --extra cpu --extra distributed gaz cluster stop
 export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+```
 
+Poi collega il worker al master usando porte fisse. Non omettere questi
+argomenti sulle porte: senza porte fisse Ray puo' usare porte random e andare in
+timeout su LAN/firewall.
+
+```bash
 uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --head 192.168.1.12:6379 \
   --node-ip 192.168.1.161 \
@@ -116,19 +147,29 @@ uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --auto
 ```
 
-Se il worker va ancora in timeout, provare prima la connettivita' base dal Mac:
+Se il worker va in timeout con `RPC error: Deadline Exceeded`, controllare prima
+la connettivita' base dal Mac:
 
 ```bash
 nc -vz 192.168.1.12 6379
 nc -vz 192.168.1.12 6380
 nc -vz 192.168.1.12 6381
+nc -vz 192.168.1.12 6382
+nc -vz 192.168.1.12 6384
+nc -vz 192.168.1.12 6385
+nc -vz 192.168.1.12 6386
 ```
 
 Se queste porte non rispondono, il problema e' firewall/rete prima del codice.
+Il training non va avviato finche' il master non vede il worker connesso.
 
 ### 3. Master terminale 2: training distribuito
 
-Eseguire questo comando solo dopo che il terminale 1 mostra il worker connesso.
+Eseguire questo comando solo dopo che il terminale 1 mostra:
+
+```text
+required Ray workers connected: 1/1
+```
 
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
@@ -137,6 +178,24 @@ uv run --no-sync --extra cuda --extra distributed gaz run `
   --config configs/connect_four_lan.yaml `
   --execution lan_ray `
   --set cluster.head_address=192.168.1.12:6379
+```
+
+A fine run, controllare che `run_state.json` contenga replay remoto importato:
+
+```powershell
+$latest = Get-Content artifacts\runs\latest.json | ConvertFrom-Json
+Get-Content (Join-Path $latest.run_dir "run_state.json") |
+  ConvertFrom-Json |
+  Select-Object status,backend,remote_workers_available,remote_workers_completed,remote_workers_failed,remote_replay_samples_imported
+```
+
+Valori attesi con un worker:
+
+```text
+remote_workers_available              1
+remote_workers_completed              1
+remote_workers_failed                 0
+remote_replay_samples_imported        > 0
 ```
 
 ### 4. Status e stop
