@@ -484,6 +484,60 @@ def test_cluster_worker_passes_fixed_ray_ports(
     ]
 
 
+def test_cluster_worker_keep_alive_can_be_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+    keep_alive_calls: list[dict] = []
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ray":
+            return object()
+        return real_import(name, globals, locals, fromlist, level)
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
+    monkeypatch.setattr(
+        cli_main,
+        "_keep_ray_worker_terminal_alive",
+        lambda **kwargs: keep_alive_calls.append(kwargs),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "worker",
+            "--head",
+            "192.168.1.12:6379",
+            "--node-ip",
+            "192.168.1.161",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "connect_four_lan.yaml"),
+            "--keep-alive",
+            "--keep-alive-poll-sec",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["command"][:2] == ["ray", "start"]
+    assert keep_alive_calls == [
+        {
+            "head": "192.168.1.12:6379",
+            "node_ip": "192.168.1.161",
+            "poll_sec": 3.0,
+        }
+    ]
+
+
 def test_cluster_worker_cleans_up_after_ray_start_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

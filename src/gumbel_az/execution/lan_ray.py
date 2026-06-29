@@ -28,6 +28,73 @@ from gumbel_az.storage.atomic import atomic_write_json
 from gumbel_az.storage.transfer import CheckpointSync, ReplayTransfer
 
 
+def _lan_progress_message(record: dict[str, Any]) -> str | None:
+    event = record.get("event")
+    if event == "lan_ray_initialized":
+        return f"[lan_ray] connected to Ray cluster: {record.get('cluster_head_address')}"
+    if event == "lan_ray_head_training_started":
+        return "[lan_ray] training lifecycle starting on head node"
+    if event == "lan_ray_no_remote_workers":
+        return "[lan_ray] no remote workers available; using head self-play"
+    if event == "lan_ray_remote_selfplay_completed":
+        imported = record.get("imported", {})
+        return (
+            "[lan_ray] remote worker completed: "
+            f"worker={record.get('worker_id')} "
+            f"node={record.get('ray_node_address')} "
+            f"games={record.get('games')} "
+            f"positions={record.get('positions')} "
+            f"imported_samples={imported.get('samples', 0)}"
+        )
+    if event == "lan_ray_remote_selfplay_failed":
+        return (
+            "[lan_ray] remote worker failed: "
+            f"node={record.get('ray_node_address')} "
+            f"error={record.get('error')}"
+        )
+    if event == "runtime_backend_selected":
+        return (
+            "[run] runtime selected: "
+            f"{record.get('runtime_backend')} device={record.get('device')} "
+            f"reason={record.get('reason')}"
+        )
+    if event == "scheduler_decision":
+        decision = record.get("decision", {})
+        return (
+            "[run] scheduler: "
+            f"iteration={record.get('iteration')} "
+            f"stage={record.get('stage')} "
+            f"selfplay={decision.get('allow_selfplay')} "
+            f"training={decision.get('allow_training')} "
+            f"reason={decision.get('reason')}"
+        )
+    if event == "selfplay_completed":
+        return (
+            "[run] self-play completed: "
+            f"iteration={record.get('iteration')} "
+            f"games={record.get('games')} "
+            f"positions={record.get('positions')}"
+        )
+    if event == "training_completed":
+        return (
+            "[run] training checkpoint: "
+            f"iteration={record.get('iteration')} "
+            f"step={record.get('train_step')} "
+            f"checkpoint={record.get('checkpoint_version')}"
+        )
+    return None
+
+
+class ConsoleEventWriter(JsonlWriter):
+    """JSONL writer that mirrors high-signal LAN training events to stdout."""
+
+    def write(self, record: dict[str, Any]) -> None:
+        super().write(record)
+        message = _lan_progress_message(record)
+        if message is not None:
+            print(message, flush=True)
+
+
 def _require_ray():
     try:
         import ray  # type: ignore[import-not-found]
@@ -315,7 +382,7 @@ class LanRayExecutionBackend:
         ray = _require_ray()
         paths = create_run_directory(config)
         save_resolved_config(config, paths.run_dir)
-        event_writer = JsonlWriter(paths.events_path)
+        event_writer = ConsoleEventWriter(paths.events_path)
         metric_writer = MetricWriter(paths.metrics_path)
         if not ray.is_initialized():
             address = config.cluster.head_address or "auto"

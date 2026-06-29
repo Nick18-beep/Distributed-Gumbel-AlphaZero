@@ -188,11 +188,11 @@ def _ray_storage_args(
 ) -> list[str]:
     args: list[str] = []
     if temp_dir is not None:
-        args.append(f"--temp-dir={temp_dir}")
+        args.append(f"--temp-dir={temp_dir.as_posix()}")
     if plasma_directory is not None:
-        args.append(f"--plasma-directory={plasma_directory}")
+        args.append(f"--plasma-directory={plasma_directory.as_posix()}")
     if object_spilling_directory is not None:
-        args.append(f"--object-spilling-directory={object_spilling_directory}")
+        args.append(f"--object-spilling-directory={object_spilling_directory.as_posix()}")
     return args
 
 
@@ -398,6 +398,33 @@ def _wait_for_ray_workers(
                 err=True,
             )
             raise typer.Exit(code=1)
+        sleep(poll_sec)
+
+
+def _keep_ray_worker_terminal_alive(
+    *,
+    head: str,
+    node_ip: str,
+    poll_sec: float,
+) -> None:
+    typer.echo(
+        "ray worker keep-alive active; leave this terminal open, "
+        "press Ctrl+C to return to the shell."
+    )
+    while True:
+        try:
+            result = subprocess.run(
+                [_ray_cli_path(), "status", f"--address={head}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=_ray_cluster_env(),
+            )
+        except (OSError, RuntimeError) as exc:
+            typer.echo(f"ray worker heartbeat failed: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        status = "connected" if result.returncode == 0 else f"status_error={result.returncode}"
+        typer.echo(f"ray worker heartbeat: head={head} node_ip={node_ip} {status}")
         sleep(poll_sec)
 
 
@@ -1103,6 +1130,17 @@ def cluster_worker(
         Path | None,
         typer.Option("--object-spilling-directory", help="Ray object spilling directory."),
     ] = None,
+    keep_alive: Annotated[
+        bool,
+        typer.Option(
+            "--keep-alive",
+            help="Keep the worker terminal open and print periodic Ray heartbeats.",
+        ),
+    ] = False,
+    keep_alive_poll_sec: Annotated[
+        float,
+        typer.Option("--keep-alive-poll-sec", min=1.0, help="Worker heartbeat interval."),
+    ] = 10.0,
     auto: Annotated[bool, typer.Option("--auto", help="Register worker capabilities.")] = False,
 ) -> None:
     """Connect a worker to a Ray head."""
@@ -1174,6 +1212,15 @@ def cluster_worker(
         typer.echo(json.dumps(capabilities.__dict__, sort_keys=True))
     else:
         typer.echo(f"ray worker connected: {head} from {resolved_node_ip}")
+    if keep_alive:
+        try:
+            _keep_ray_worker_terminal_alive(
+                head=head,
+                node_ip=resolved_node_ip,
+                poll_sec=keep_alive_poll_sec,
+            )
+        except KeyboardInterrupt:
+            typer.echo("ray worker keep-alive stopped; Ray processes are still running.")
 
 
 @cluster_app.command("wait")

@@ -11,6 +11,7 @@ import gumbel_az.execution.lan_ray as lan_ray_module
 from gumbel_az.config import load_config
 from gumbel_az.execution.heartbeat import HeartbeatRegistry
 from gumbel_az.execution.lan_ray import (
+    ConsoleEventWriter,
     HeadController,
     LanRayExecutionBackend,
     WorkerActorCore,
@@ -339,6 +340,25 @@ def test_remote_ray_nodes_excludes_current_head_node() -> None:
     remote_nodes = lan_ray_module._remote_ray_nodes(fake_ray)
 
     assert [node["NodeID"] for node in remote_nodes] == ["mac-worker", "win-worker"]
+
+
+def test_console_event_writer_prints_high_signal_progress(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    writer = ConsoleEventWriter(tmp_path / "events.jsonl")
+
+    writer.write(
+        {
+            "event": "training_completed",
+            "iteration": 2,
+            "train_step": 10,
+            "checkpoint_version": 10,
+        }
+    )
+
+    assert "[run] training checkpoint: iteration=2 step=10 checkpoint=10" in capsys.readouterr().out
+    assert (tmp_path / "events.jsonl").exists()
 
 
 def test_lan_ray_backend_runs_training_after_cluster_init(

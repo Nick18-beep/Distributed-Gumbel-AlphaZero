@@ -155,8 +155,14 @@ uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --temp-dir /tmp/ray-gaz \
   --plasma-directory /tmp \
   --object-spilling-directory /tmp/ray-gaz-spill \
+  --keep-alive \
+  --keep-alive-poll-sec 10 \
   --auto
 ```
+
+Con `--keep-alive` il terminale worker resta aperto e stampa heartbeat periodici
+verso il cluster. Per tornare alla shell premere `Ctrl+C`; i processi Ray
+restano attivi finche' non si esegue `gaz cluster stop`.
 
 Se il worker va in timeout con `RPC error: Deadline Exceeded`, controllare prima
 la connettivita' base dal Mac. Se queste porte rispondono, il master e'
@@ -229,6 +235,15 @@ uv run --no-sync --extra cuda --extra distributed gaz run `
   --config configs/connect_four_lan.yaml `
   --execution lan_ray `
   --set cluster.head_address=192.168.1.12:6379
+```
+
+Durante il run il master stampa eventi di avanzamento come:
+
+```text
+[lan_ray] connected to Ray cluster: 192.168.1.12:6379
+[lan_ray] remote worker completed: worker=... imported_samples=...
+[run] scheduler: iteration=0 stage=before_training selfplay=True training=True ...
+[run] training checkpoint: iteration=0 step=...
 ```
 
 A fine run, controllare che `run_state.json` contenga replay remoto importato:
