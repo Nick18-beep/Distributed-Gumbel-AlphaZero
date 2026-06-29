@@ -130,9 +130,12 @@ export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
 Poi collega il worker al master usando porte fisse. Non omettere questi
 argomenti sulle porte: senza porte fisse Ray puo' usare porte random e andare in
 timeout su LAN/firewall.
-Su macOS usare anche path temporanei corti (`/tmp/...`): Ray/Plasma puo'
-crashare con `Invalid argument` se usa il `TMPDIR` macOS lungo sotto
-`/var/folders/...`.
+Su macOS il comando `gaz cluster worker` applica automaticamente path temporanei
+corti (`/tmp/ray-gaz`, `/tmp`, `/tmp/ray-gaz-spill`) quando non sono indicati.
+Sono lasciati espliciti nel comando sotto per rendere chiara la configurazione:
+Ray/Plasma puo' crashare con `Invalid argument` se usa un path temporaneo non
+adatto, per esempio il `TMPDIR` lungo sotto `/var/folders/...` oppure un path
+Windows rimasto in cache come `C:\Users\nicol\AppData\Local\Temp\ray`.
 
 ```bash
 mkdir -p /tmp/ray-gaz /tmp/ray-gaz-spill
@@ -156,7 +159,9 @@ uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
 ```
 
 Se il worker va in timeout con `RPC error: Deadline Exceeded`, controllare prima
-la connettivita' base dal Mac:
+la connettivita' base dal Mac. Se queste porte rispondono, il master e'
+raggiungibile e il problema e' quasi certamente nello startup locale del worker
+Ray, non nella rete.
 
 ```bash
 nc -vz 192.168.1.12 6379
@@ -168,8 +173,46 @@ nc -vz 192.168.1.12 6385
 nc -vz 192.168.1.12 6386
 ```
 
-Se queste porte non rispondono, il problema e' firewall/rete prima del codice.
+Per diagnosticare il caso Ray/Plasma su macOS, cercare l'ultimo `raylet.out` e
+`raylet.err`:
+
+```bash
+find /tmp/ray-gaz -maxdepth 4 -type f \
+  \( -name 'raylet.out' -o -name 'raylet.err' \) -print | tail -20
+```
+
+Il sintomo tipico e':
+
+```text
+Starting object store with directory C:\Users\nicol\AppData\Local\Temp\ray
+Unhandled exception ... Invalid argument [system:22]
+```
+
+In quel caso fermare Ray e rilanciare il worker con i tre argomenti
+`--temp-dir`, `--plasma-directory` e `--object-spilling-directory` mostrati
+sopra:
+
+```bash
+uv run --no-sync --extra cpu --extra distributed gaz cluster stop
+mkdir -p /tmp/ray-gaz /tmp/ray-gaz-spill
+```
+
 Il training non va avviato finche' il master non vede il worker connesso.
+Una verifica positiva da master deve mostrare due nodi attivi:
+
+```powershell
+uv run --no-sync --extra cuda --extra distributed gaz cluster status --head 192.168.1.12:6379
+```
+
+Con master `192.168.1.12` e worker `192.168.1.161`, l'output atteso contiene:
+
+```text
+Active:
+  ...
+  ...
+Resources:
+  0.0/20.0 CPU
+```
 
 ### 3. Master terminale 2: training distribuito
 
