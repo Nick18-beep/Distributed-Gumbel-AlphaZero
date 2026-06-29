@@ -130,8 +130,13 @@ export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
 Poi collega il worker al master usando porte fisse. Non omettere questi
 argomenti sulle porte: senza porte fisse Ray puo' usare porte random e andare in
 timeout su LAN/firewall.
+Su macOS usare anche path temporanei corti (`/tmp/...`): Ray/Plasma puo'
+crashare con `Invalid argument` se usa il `TMPDIR` macOS lungo sotto
+`/var/folders/...`.
 
 ```bash
+mkdir -p /tmp/ray-gaz /tmp/ray-gaz-spill
+
 uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --head 192.168.1.12:6379 \
   --node-ip 192.168.1.161 \
@@ -144,6 +149,9 @@ uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --metrics-export-port 6386 \
   --min-worker-port 10002 \
   --max-worker-port 10101 \
+  --temp-dir /tmp/ray-gaz \
+  --plasma-directory /tmp \
+  --object-spilling-directory /tmp/ray-gaz-spill \
   --auto
 ```
 

@@ -308,6 +308,18 @@ def test_ray_port_args_require_complete_worker_range() -> None:
         cli_main._ray_port_args(min_worker_port=10101, max_worker_port=10002)
 
 
+def test_ray_storage_args_are_forwarded() -> None:
+    assert cli_main._ray_storage_args(
+        temp_dir=Path("/tmp/ray-gaz"),
+        plasma_directory=Path("/tmp"),
+        object_spilling_directory=Path("/tmp/ray-gaz-spill"),
+    ) == [
+        "--temp-dir=/tmp/ray-gaz",
+        "--plasma-directory=/tmp",
+        "--object-spilling-directory=/tmp/ray-gaz-spill",
+    ]
+
+
 def test_cluster_head_reports_busy_ports_before_ray_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -180,6 +180,22 @@ def _ray_port_args(
     return args
 
 
+def _ray_storage_args(
+    *,
+    temp_dir: Path | None = None,
+    plasma_directory: Path | None = None,
+    object_spilling_directory: Path | None = None,
+) -> list[str]:
+    args: list[str] = []
+    if temp_dir is not None:
+        args.append(f"--temp-dir={temp_dir}")
+    if plasma_directory is not None:
+        args.append(f"--plasma-directory={plasma_directory}")
+    if object_spilling_directory is not None:
+        args.append(f"--object-spilling-directory={object_spilling_directory}")
+    return args
+
+
 def _ray_fixed_ports(
     *,
     head_port: int | None = None,
@@ -900,6 +916,21 @@ def cluster_head(
         int | None,
         typer.Option("--max-worker-port", min=1, max=65535, help="Last fixed Ray worker port."),
     ] = None,
+    temp_dir: Annotated[
+        Path | None,
+        typer.Option("--temp-dir", help="Ray temporary directory. Use a short path on macOS."),
+    ] = None,
+    plasma_directory: Annotated[
+        Path | None,
+        typer.Option(
+            "--plasma-directory",
+            help="Ray Plasma object store directory. Use /tmp on macOS.",
+        ),
+    ] = None,
+    object_spilling_directory: Annotated[
+        Path | None,
+        typer.Option("--object-spilling-directory", help="Ray object spilling directory."),
+    ] = None,
 ) -> None:
     """Start a Ray head node."""
     _validate_config(config, overrides)
@@ -917,6 +948,11 @@ def cluster_head(
         metrics_export_port=metrics_export_port,
         min_worker_port=min_worker_port,
         max_worker_port=max_worker_port,
+    )
+    ray_storage_args = _ray_storage_args(
+        temp_dir=temp_dir,
+        plasma_directory=plasma_directory,
+        object_spilling_directory=object_spilling_directory,
     )
     _ensure_local_ray_ports_available(
         _ray_fixed_ports(
@@ -937,7 +973,7 @@ def cluster_head(
         + _ray_worker_command_hint(
             head=f"{node_ip}:{port}",
             config=config,
-            ray_port_args=ray_port_args,
+            ray_port_args=[*ray_port_args, *ray_storage_args],
             include_node_ip_placeholder=not sys.platform.startswith("linux"),
         )
     )
@@ -962,6 +998,7 @@ def cluster_head(
                 "--include-dashboard=false",
                 "--disable-usage-stats",
                 *ray_port_args,
+                *ray_storage_args,
             ],
             check=True,
             env=ray_env,
@@ -1051,6 +1088,21 @@ def cluster_worker(
         int | None,
         typer.Option("--max-worker-port", min=1, max=65535, help="Last fixed Ray worker port."),
     ] = None,
+    temp_dir: Annotated[
+        Path | None,
+        typer.Option("--temp-dir", help="Ray temporary directory. Use a short path on macOS."),
+    ] = None,
+    plasma_directory: Annotated[
+        Path | None,
+        typer.Option(
+            "--plasma-directory",
+            help="Ray Plasma object store directory. Use /tmp on macOS.",
+        ),
+    ] = None,
+    object_spilling_directory: Annotated[
+        Path | None,
+        typer.Option("--object-spilling-directory", help="Ray object spilling directory."),
+    ] = None,
     auto: Annotated[bool, typer.Option("--auto", help="Register worker capabilities.")] = False,
 ) -> None:
     """Connect a worker to a Ray head."""
@@ -1069,6 +1121,11 @@ def cluster_worker(
         metrics_export_port=metrics_export_port,
         min_worker_port=min_worker_port,
         max_worker_port=max_worker_port,
+    )
+    ray_storage_args = _ray_storage_args(
+        temp_dir=temp_dir,
+        plasma_directory=plasma_directory,
+        object_spilling_directory=object_spilling_directory,
     )
     _ensure_local_ray_ports_available(
         _ray_fixed_ports(
@@ -1103,6 +1160,7 @@ def cluster_worker(
                 f"--node-ip-address={resolved_node_ip}",
                 "--disable-usage-stats",
                 *ray_port_args,
+                *ray_storage_args,
             ],
             check=True,
             env=ray_env,
