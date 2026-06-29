@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import builtins
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -97,3 +99,19 @@ def test_doctor_cuda_reports_clear_diagnostic(
     assert "torch cuda available" in result.output or "[ERROR] torch:" in result.output
     if result.exit_code != 0:
         assert "cuda" in result.output.lower() or "torch" in result.output.lower()
+
+
+def test_torch_checks_report_incomplete_torch_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        doctor_module,
+        "_safe_find_spec",
+        lambda module_name: object() if module_name == "torch" else None,
+    )
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(__version__="broken"))
+
+    results = doctor_module._torch_checks(cuda_requested=False)
+
+    assert [result.status for result in results] == ["ERROR", "ERROR"]
+    assert "torch.cuda is missing" in results[1].detail

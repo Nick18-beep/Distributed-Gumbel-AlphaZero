@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import socket
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -188,12 +190,16 @@ class WorkerActorCore:
         self,
         config_data: dict[str, Any],
         *,
-        work_dir: Path,
+        work_dir: str | os.PathLike[str] | None = None,
         games: int,
         seed: int,
     ) -> dict[str, Any]:
         config = AppConfig.model_validate(config_data)
-        replay_dir = work_dir / self.capabilities.worker_id / "replay"
+        if work_dir is None:
+            root = Path(tempfile.gettempdir()) / "gumbel_az_ray_workers"
+        else:
+            root = Path(work_dir)
+        replay_dir = root / self.capabilities.worker_id / "replay"
         runtime = detect_runtime_backend()
         if runtime.name != "torch":
             raise RuntimeError(runtime.reason)
@@ -249,6 +255,52 @@ def make_ray_worker_actor():
     return RayWorkerActor
 
 
+def _current_ray_node_id(ray: Any, alive_nodes: list[dict[str, Any]]) -> str | None:
+    try:
+        return str(ray.get_runtime_context().get_node_id())
+    except (AttributeError, RuntimeError):
+        if alive_nodes:
+            return str(alive_nodes[0].get("NodeID", ""))
+        return None
+
+
+def _remote_ray_nodes(ray: Any) -> list[dict[str, Any]]:
+    alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+    current_node_id = _current_ray_node_id(ray, alive_nodes)
+    if current_node_id is None:
+        return []
+    return [
+        node
+        for node in alive_nodes
+        if str(node.get("NodeID", "")) != current_node_id
+    ]
+
+
+def _ray_node_affinity_options(node_id: str) -> dict[str, Any]:
+    try:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    except Exception as exc:
+        raise RuntimeError(
+            "Ray node-affinity scheduling is unavailable; upgrade Ray or use "
+            "single_process/local_multiprocess."
+        ) from exc
+    return {
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(
+            node_id=node_id,
+            soft=False,
+        )
+    }
+
+
+def _ray_node_address(node: dict[str, Any]) -> str:
+    return str(
+        node.get(
+            "NodeManagerAddress",
+            node.get("NodeManagerHostname", "unknown"),
+        )
+    )
+
+
 class LanRayExecutionBackend:
     """Run the training lifecycle after connecting to a Ray LAN cluster."""
 
@@ -291,24 +343,37 @@ class LanRayExecutionBackend:
                 ),
             }
         )
-        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
-        remote_worker_count = max(0, len(alive_nodes) - 1)
-        if remote_worker_count > 0:
+        remote_nodes = _remote_ray_nodes(ray)
+        remote_stats = {
+            "remote_workers_available": len(remote_nodes),
+            "remote_workers_scheduled": 0,
+            "remote_workers_completed": 0,
+            "remote_workers_failed": 0,
+            "remote_games": 0,
+            "remote_positions": 0,
+            "remote_replay_samples_imported": 0,
+        }
+        if remote_nodes:
             games = min(
                 config.stop.max_games or config.selfplay.games_per_iteration,
                 config.selfplay.games_per_iteration,
             )
-            actors = [
-                make_ray_worker_actor().remote()
-                for _ in range(min(remote_worker_count, games))
-            ]
+            worker_actor = make_ray_worker_actor()
+            selected_nodes = remote_nodes[: min(len(remote_nodes), games)]
+            remote_stats["remote_workers_scheduled"] = len(selected_nodes)
+            actors = []
+            for node in selected_nodes:
+                node_id = str(node.get("NodeID", ""))
+                actors.append(
+                    worker_actor.options(**_ray_node_affinity_options(node_id)).remote()
+                )
             games_per_actor = [games // len(actors)] * len(actors)
             for index in range(games % len(actors)):
                 games_per_actor[index] += 1
             futures = [
                 actor.generate_replay_shard.remote(
                     config.model_dump(mode="json"),
-                    work_dir=paths.run_dir / "ray_worker_tmp",
+                    work_dir=None,
                     games=actor_games,
                     seed=config.run.seed + 100_000 + index * 10_000,
                 )
@@ -320,14 +385,34 @@ class LanRayExecutionBackend:
             head = HeadController(run_dir=paths.run_dir, event_writer=event_writer)
             upload_dir = paths.run_dir / "ray_uploads"
             upload_dir.mkdir(parents=True, exist_ok=True)
-            for payload in ray.get(futures):
+            for index, future in enumerate(futures):
+                node = selected_nodes[index]
+                try:
+                    payload = ray.get(future)
+                except Exception as exc:
+                    event_writer.write(
+                        {
+                            "event": "lan_ray_remote_selfplay_failed",
+                            "ray_node_id": str(node.get("NodeID", "")),
+                            "ray_node_address": _ray_node_address(node),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    remote_stats["remote_workers_failed"] += 1
+                    continue
                 shard_path = upload_dir / f"{payload['worker_id']}_{payload['replay_shard_name']}"
                 shard_path.write_bytes(payload.pop("replay_shard_bytes"))
                 imported = head.upload_replay_shard(payload["worker_id"], str(shard_path))
+                remote_stats["remote_workers_completed"] += 1
+                remote_stats["remote_games"] += int(payload.get("games", 0))
+                remote_stats["remote_positions"] += int(payload.get("positions", 0))
+                remote_stats["remote_replay_samples_imported"] += int(imported.get("samples", 0))
                 event_writer.write(
                     {
                         "event": "lan_ray_remote_selfplay_completed",
                         **payload,
+                        "ray_node_id": str(node.get("NodeID", "")),
+                        "ray_node_address": _ray_node_address(node),
                         "imported": imported,
                     }
                 )
@@ -339,10 +424,17 @@ class LanRayExecutionBackend:
                     "note": "No remote Ray worker nodes were available; using head self-play.",
                 }
             )
-        return RunOrchestrator(
+        state.update(remote_stats)
+        atomic_write_json(paths.run_state_path, state)
+        result = RunOrchestrator(
             config,
             paths=paths,
             runtime_backend=runtime_backend,
             event_writer=event_writer,
             metric_writer=metric_writer,
         ).run()
+        if paths.run_state_path.exists():
+            final_state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))
+            final_state.update(remote_stats)
+            atomic_write_json(paths.run_state_path, final_state)
+        return result

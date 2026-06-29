@@ -42,12 +42,22 @@ def detect_torch_runtime() -> RuntimeBackend:
 
     import torch
 
-    if torch.cuda.is_available():
+    torch_cuda = getattr(torch, "cuda", None)
+    if torch_cuda is None:
+        return RuntimeBackend(
+            name="none",
+            torch_available=False,
+            device="none",
+            device_count=0,
+            reason="PyTorch installation appears incomplete (torch.cuda is missing)",
+        )
+
+    if torch_cuda.is_available():
         return RuntimeBackend(
             name="torch",
             torch_available=True,
             device="cuda",
-            device_count=torch.cuda.device_count(),
+            device_count=torch_cuda.device_count(),
             reason="PyTorch available; using CUDA",
         )
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():

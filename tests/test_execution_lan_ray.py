@@ -21,6 +21,7 @@ from gumbel_az.execution.messages import WorkerCapabilities, utc_now
 from gumbel_az.execution.task_lease import TaskLeaseManager
 from gumbel_az.replay import ReplayWriter
 from gumbel_az.replay.codec import encode_samples
+from gumbel_az.replay.schema import SCHEMA_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEBUG_CONFIG = PROJECT_ROOT / "configs" / "connect_four_cpu_debug.yaml"
@@ -40,6 +41,75 @@ class _FakeRay:
 
     def nodes(self) -> list[dict]:
         return [{"Alive": True, "NodeID": "head"}]
+
+
+class _FakeRuntimeContext:
+    def __init__(self, node_id: str) -> None:
+        self.node_id = node_id
+
+    def get_node_id(self) -> str:
+        return self.node_id
+
+
+class _FakeRayWithNodes:
+    def __init__(self, node_id: str, nodes: list[dict]) -> None:
+        self.node_id = node_id
+        self._nodes = nodes
+
+    def get_runtime_context(self) -> _FakeRuntimeContext:
+        return _FakeRuntimeContext(self.node_id)
+
+    def nodes(self) -> list[dict]:
+        return self._nodes
+
+
+class _FakeRayWithRemoteWorkers(_FakeRayWithNodes):
+    def __init__(self, nodes: list[dict]) -> None:
+        super().__init__("head-node", nodes)
+        self.init_calls: list[dict] = []
+        self._initialized = False
+
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+    def init(self, **kwargs) -> None:
+        self.init_calls.append(kwargs)
+        self._initialized = True
+
+    def get(self, future):
+        if isinstance(future, BaseException):
+            raise future
+        return future
+
+
+class _RemoteMethod:
+    def __init__(self, callback) -> None:
+        self.callback = callback
+
+    def remote(self, *args, **kwargs):
+        return self.callback(*args, **kwargs)
+
+
+class _FakeRemoteActor:
+    def __init__(self, result) -> None:
+        self.result = result
+        self.generate_replay_shard = _RemoteMethod(lambda *args, **kwargs: result)
+
+
+class _FakeWorkerActorFactory:
+    def __init__(self, results: list) -> None:
+        self.results = results
+        self.options_calls: list[dict] = []
+        self.created = 0
+
+    def options(self, **kwargs):
+        self.options_calls.append(kwargs)
+        return self
+
+    def remote(self):
+        result = self.results[self.created]
+        self.created += 1
+        return _FakeRemoteActor(result)
 
 
 def _capabilities(worker_id: str = "worker-1") -> WorkerCapabilities:
@@ -69,6 +139,15 @@ def _sample(index: int = 0) -> dict:
         "model_version": 0,
         "search_stats": {"root_value": 0.0},
     }
+
+
+def _encoded_sample_shard() -> bytes:
+    sample = {
+        **_sample(0),
+        "schema_version": SCHEMA_VERSION,
+        "timestamp": "2026-01-01T00:00:00Z",
+    }
+    return encode_samples([sample])
 
 
 def test_heartbeat_registry_marks_stale_workers_lost() -> None:
@@ -246,6 +325,22 @@ def test_ray_actor_factories_keep_ray_optional() -> None:
         assert "Ray is not installed" in str(exc) or "Ray could not be imported" in str(exc)
 
 
+def test_remote_ray_nodes_excludes_current_head_node() -> None:
+    fake_ray = _FakeRayWithNodes(
+        "head-node",
+        [
+            {"Alive": True, "NodeID": "head-node", "NodeManagerAddress": "192.168.1.12"},
+            {"Alive": True, "NodeID": "mac-worker", "NodeManagerAddress": "192.168.1.161"},
+            {"Alive": False, "NodeID": "dead-worker", "NodeManagerAddress": "192.168.1.99"},
+            {"Alive": True, "NodeID": "win-worker", "NodeManagerAddress": "192.168.1.180"},
+        ],
+    )
+
+    remote_nodes = lan_ray_module._remote_ray_nodes(fake_ray)
+
+    assert [node["NodeID"] for node in remote_nodes] == ["mac-worker", "win-worker"]
+
+
 def test_lan_ray_backend_runs_training_after_cluster_init(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -260,7 +355,7 @@ def test_lan_ray_backend_runs_training_after_cluster_init(
             "cluster.enabled=true",
             "cluster.head_address=127.0.0.1:6399",
             "selfplay.games_per_iteration=1",
-            "stop.max_games=1",
+            "stop.max_games=2",
             "stop.max_iterations=1",
             "search.simulations_per_move=2",
             "training.batch_size=4",
@@ -282,6 +377,8 @@ def test_lan_ray_backend_runs_training_after_cluster_init(
     assert state["status"] == "completed"
     assert state["train_step"] == 1
     assert state["games_seen"] == 1
+    assert state["remote_workers_available"] == 0
+    assert state["remote_replay_samples_imported"] == 0
     assert (result.run_dir / "replay" / "index.json").exists()
     assert (result.run_dir / "checkpoints" / "latest.json").exists()
     assert (result.run_dir / "eval" / "matches.jsonl").exists()
@@ -289,3 +386,82 @@ def test_lan_ray_backend_runs_training_after_cluster_init(
     assert '"event": "lan_ray_initialized"' in events
     assert '"event": "lan_ray_head_training_started"' in events
     assert '"event": "training_completed"' in events
+
+
+def test_lan_ray_backend_continues_when_one_remote_worker_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_ray = _FakeRayWithRemoteWorkers(
+        [
+            {"Alive": True, "NodeID": "head-node", "NodeManagerAddress": "192.168.1.12"},
+            {"Alive": True, "NodeID": "mac-worker", "NodeManagerAddress": "192.168.1.161"},
+            {"Alive": True, "NodeID": "win-worker", "NodeManagerAddress": "192.168.1.180"},
+        ]
+    )
+    worker_factory = _FakeWorkerActorFactory(
+        [
+            {
+                "worker_id": "mac-worker",
+                "runtime_backend": "torch",
+                "device": "cpu",
+                "replay_shard": "/tmp/worker/shard_000000001.msgpack.zst",
+                "replay_shard_name": "shard_000000001.msgpack.zst",
+                "replay_shard_bytes": _encoded_sample_shard(),
+                "games": 1,
+                "positions": 1,
+                "games_per_sec": 1.0,
+                "positions_per_sec": 1.0,
+            },
+            RuntimeError("worker environment is missing torch"),
+        ]
+    )
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    monkeypatch.setattr(lan_ray_module, "make_ray_worker_actor", lambda: worker_factory)
+    monkeypatch.setattr(
+        lan_ray_module,
+        "_ray_node_affinity_options",
+        lambda node_id: {"test_node_id": node_id},
+    )
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=2",
+            "selfplay.batch_size=1",
+            "stop.max_games=2",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "replay.min_samples_to_train=1",
+            "replay.low_watermark=1",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().run(config)
+
+    assert result.status == "completed"
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    replay_index = json.loads(
+        (result.run_dir / "replay" / "index.json").read_text(encoding="utf-8")
+    )
+    assert '"event": "lan_ray_remote_selfplay_completed"' in events
+    assert '"event": "lan_ray_remote_selfplay_failed"' in events
+    assert state["remote_workers_available"] == 2
+    assert state["remote_workers_scheduled"] == 2
+    assert state["remote_workers_completed"] == 1
+    assert state["remote_workers_failed"] == 1
+    assert state["remote_replay_samples_imported"] == 1
+    assert replay_index["total_samples"] >= 1
+    assert worker_factory.options_calls == [
+        {"test_node_id": "mac-worker"},
+        {"test_node_id": "win-worker"},
+    ]

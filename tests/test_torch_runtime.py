@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 from gumbel_az.config import load_config
 from gumbel_az.execution import SingleProcessExecutionBackend
 from gumbel_az.replay import ReplayReader
 from gumbel_az.runtime import RuntimeBackend, detect_runtime_backend
+from gumbel_az.runtime import backend as backend_module
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEBUG_CONFIG = PROJECT_ROOT / "configs" / "connect_four_cpu_debug.yaml"
@@ -18,6 +21,17 @@ def test_runtime_backend_detects_torch() -> None:
     assert backend.torch_available
     assert backend.name == "torch"
     assert backend.device in {"cpu", "cuda", "mps"}
+
+
+def test_runtime_backend_reports_incomplete_torch_install(monkeypatch) -> None:
+    monkeypatch.setattr(backend_module, "_can_import", lambda module_name: (True, "available"))
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(__version__="broken"))
+
+    backend = backend_module.detect_torch_runtime()
+
+    assert backend.name == "none"
+    assert backend.torch_available is False
+    assert "torch.cuda is missing" in backend.reason
 
 
 def test_single_process_uses_torch_runtime(

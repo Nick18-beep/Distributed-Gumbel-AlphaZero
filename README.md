@@ -49,6 +49,8 @@ Prima di partire, assicurarsi che firewall e rete permettano TCP tra worker e
 master su `6379`, `6380-6386` e `10002-10101`.
 Se un avvio Ray fallito lascia porte occupate, il comando segnala quali porte
 sono in uso: fermare Ray con `gaz cluster stop` e ripartire.
+Dopo il bootstrap/sync iniziale, usare `uv run --no-sync` nei terminali cluster:
+evita sync concorrenti della stessa `.venv` mentre Ray e' attivo.
 
 ### 0. Setup ambiente
 
@@ -72,9 +74,9 @@ uv run --extra cpu --extra distributed gaz doctor --distributed
 
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
-uv run --extra cuda --extra distributed gaz cluster stop
+uv run --no-sync --extra cuda --extra distributed gaz cluster stop
 
-uv run --extra cuda --extra distributed gaz cluster head `
+uv run --no-sync --extra cuda --extra distributed gaz cluster head `
   --config configs/connect_four_lan.yaml `
   --host 0.0.0.0 `
   --port 6379 `
@@ -96,10 +98,10 @@ Lasciare aperto questo terminale: stampa quando il worker si collega.
 
 ```bash
 cd /Users/nicolo/Desktop/Distributed-Gumbel-AlphaZero
-uv run --extra cpu --extra distributed gaz cluster stop
+uv run --no-sync --extra cpu --extra distributed gaz cluster stop
 export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
 
-uv run --extra cpu --extra distributed gaz cluster worker \
+uv run --no-sync --extra cpu --extra distributed gaz cluster worker \
   --head 192.168.1.12:6379 \
   --node-ip 192.168.1.161 \
   --config configs/connect_four_lan.yaml \
@@ -131,7 +133,7 @@ Eseguire questo comando solo dopo che il terminale 1 mostra il worker connesso.
 ```powershell
 cd "D:\nicol\Distributed Gumbel AlphaZero"
 
-uv run --extra cuda --extra distributed gaz run `
+uv run --no-sync --extra cuda --extra distributed gaz run `
   --config configs/connect_four_lan.yaml `
   --execution lan_ray `
   --set cluster.head_address=192.168.1.12:6379
@@ -142,7 +144,7 @@ uv run --extra cuda --extra distributed gaz run `
 Status dal master:
 
 ```powershell
-uv run --extra cuda --extra distributed gaz cluster status --head 192.168.1.12:6379
+uv run --no-sync --extra cuda --extra distributed gaz cluster status --head 192.168.1.12:6379
 ```
 
 Fermare Ray quando il training e' concluso.
@@ -150,13 +152,13 @@ Fermare Ray quando il training e' concluso.
 Master Windows:
 
 ```powershell
-uv run --extra cuda --extra distributed gaz cluster stop
+uv run --no-sync --extra cuda --extra distributed gaz cluster stop
 ```
 
 Worker Linux/macOS:
 
 ```bash
-uv run --extra cpu --extra distributed gaz cluster stop
+uv run --no-sync --extra cpu --extra distributed gaz cluster stop
 ```
 
 Per worker Linux/WSL2 usare lo stesso comando worker macOS, cambiando solo

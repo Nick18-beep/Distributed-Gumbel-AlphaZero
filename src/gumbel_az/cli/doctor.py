@@ -198,7 +198,19 @@ def _torch_checks(cuda_requested: bool) -> list[CheckResult]:
         results.append(CheckResult("ERROR", "torch", f"{type(exc).__name__}: {exc}"))
         return results
 
-    cuda_available = torch.cuda.is_available()
+    torch_cuda = getattr(torch, "cuda", None)
+    if torch_cuda is None:
+        results.append(CheckResult("ERROR", "torch", getattr(torch, "__version__", "installed")))
+        results.append(
+            CheckResult(
+                "ERROR",
+                "torch cuda available",
+                "torch.cuda is missing; PyTorch installation appears incomplete",
+            )
+        )
+        return results
+
+    cuda_available = torch_cuda.is_available()
     mps_available = (
         getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
     )
@@ -206,8 +218,8 @@ def _torch_checks(cuda_requested: bool) -> list[CheckResult]:
     results.append(CheckResult("OK", "torch cuda available", str(cuda_available)))
     if cuda_available:
         devices = [
-            f"cuda:{index} {torch.cuda.get_device_name(index)}"
-            for index in range(torch.cuda.device_count())
+            f"cuda:{index} {torch_cuda.get_device_name(index)}"
+            for index in range(torch_cuda.device_count())
         ]
         results.append(CheckResult("OK", "torch cuda devices", ", ".join(devices)))
     results.append(CheckResult("OK", "torch mps available", str(mps_available)))
