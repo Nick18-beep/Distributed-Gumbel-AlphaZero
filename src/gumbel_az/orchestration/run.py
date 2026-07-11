@@ -117,6 +117,7 @@ class RunOrchestrator:
                 previous_state = {}
         self._write_state(
             status="running",
+            error=None,
             created_at=previous_state.get("created_at", _utc_now()),
             config_path=str(self.paths.resolved_config_path),
             resumed_from_checkpoint=bool(self.resume),
@@ -163,6 +164,7 @@ class RunOrchestrator:
                 replay_reader=replay_reader,
                 checkpoint_manager=checkpoint_manager,
                 metric_writer=self.metric_writer,
+                device=self.runtime_backend.device,
             )
             if self.resume:
                 try:
@@ -189,16 +191,12 @@ class RunOrchestrator:
             )
             selfplay_worker.model_version = int(trainer.state.step)
 
-            total_games = (
-                int(previous_state.get("games_seen", 0))
-                if self.resume
-                else int(previous_state.get("remote_games", 0))
+            total_games = (int(previous_state.get("games_seen", 0)) if self.resume else 0) + int(
+                previous_state.get("remote_games", 0)
             )
             total_positions = (
-                int(previous_state.get("samples_seen", 0))
-                if self.resume
-                else int(previous_state.get("remote_positions", 0))
-            )
+                int(previous_state.get("samples_seen", 0)) if self.resume else 0
+            ) + int(previous_state.get("remote_positions", 0))
             iterations_completed = (
                 int(previous_state.get("iterations_completed", 0)) if self.resume else 0
             )
@@ -335,6 +333,7 @@ class RunOrchestrator:
                         self.config,
                         eval_dir=self.paths.run_dir / "eval",
                         event_writer=self.event_writer,
+                        device=self.runtime_backend.device,
                     )
                     eval_result = arena.evaluate_vs_random(
                         model=latest_train_result.state.model,
@@ -433,3 +432,8 @@ class RunOrchestrator:
                 run_dir=self.paths.run_dir,
                 status="interrupted",
             )
+        except Exception as exc:
+            error = {"type": type(exc).__name__, "message": str(exc)}
+            self._write_state(status="failed", error=error)
+            self.event_writer.write({"event": "run_failed", "error": error})
+            raise

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 
@@ -15,13 +17,13 @@ class ReplaySampler:
         self.reader = reader
         self.window_samples = window_samples
 
-    def samples(self) -> list[dict]:
+    def samples(self) -> list[dict[str, Any]]:
         samples = self.reader.read_all()
         if self.window_samples > 0:
             return samples[-self.window_samples :]
         return samples
 
-    def arrays_from(self, samples: list[dict]) -> dict[str, np.ndarray]:
+    def arrays_from(self, samples: list[dict[str, Any]]) -> dict[str, np.ndarray]:
         if not samples:
             raise ValueError("cannot sample from empty replay")
         return {
@@ -44,8 +46,7 @@ class ReplaySampler:
         pin_memory: bool = False,
     ) -> dict[str, torch.Tensor]:
         tensors = {
-            key: torch.as_tensor(value, dtype=torch.float32)
-            for key, value in arrays.items()
+            key: torch.as_tensor(value, dtype=torch.float32) for key, value in arrays.items()
         }
         if pin_memory:
             try:

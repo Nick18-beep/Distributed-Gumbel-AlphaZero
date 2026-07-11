@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -18,20 +20,24 @@ class TorchTrainState:
     schedule: WarmupCosineSchedule
     step: int
     device: torch.device
-    scaler: torch.amp.GradScaler | None = None
+    scaler: Any | None = None
     compile_enabled: bool = False
     compile_mode: str = "eager"
 
 
 def _global_grad_norm(model: torch.nn.Module) -> float:
-    norms = [
-        param.grad.detach().norm(2)
-        for param in model.parameters()
-        if param.grad is not None
-    ]
+    norms = [param.grad.detach().norm(2) for param in model.parameters() if param.grad is not None]
     if not norms:
         return 0.0
     return float(torch.norm(torch.stack(norms), 2).detach().cpu())
+
+
+def _validate_grad_norm(value: float, *, amp_overflow_is_managed: bool) -> tuple[float, bool]:
+    if math.isfinite(value):
+        return value, False
+    if amp_overflow_is_managed:
+        return 0.0, True
+    raise FloatingPointError(f"non-finite gradient norm: {value}")
 
 
 def train_step(
@@ -55,14 +61,20 @@ def train_step(
         state.scaler.unscale_(state.optimizer)
         if config.gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(state.model.parameters(), config.gradient_clip_norm)
-        grad_norm = _global_grad_norm(state.model)
+        grad_norm, amp_overflow = _validate_grad_norm(
+            _global_grad_norm(state.model),
+            amp_overflow_is_managed=True,
+        )
         state.scaler.step(state.optimizer)
         state.scaler.update()
     else:
-        loss.backward()
+        loss.backward()  # type: ignore[no-untyped-call]
         if config.gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(state.model.parameters(), config.gradient_clip_norm)
-        grad_norm = _global_grad_norm(state.model)
+        grad_norm, amp_overflow = _validate_grad_norm(
+            _global_grad_norm(state.model),
+            amp_overflow_is_managed=False,
+        )
         state.optimizer.step()
     state.step += 1
     metrics = {key: float(value.detach().cpu()) for key, value in loss_metrics.items()}
@@ -71,6 +83,7 @@ def train_step(
             "loss": float(loss.detach().cpu()),
             "learning_rate": float(lr),
             "grad_norm": grad_norm,
+            "amp_overflow": float(amp_overflow),
         }
     )
     return state, metrics

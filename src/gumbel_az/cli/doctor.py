@@ -10,6 +10,7 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from shutil import which
 from typing import Protocol
@@ -42,7 +43,7 @@ def _local_uv_path() -> Path:
     return Path.home() / ".local" / "bin" / executable
 
 
-def _safe_find_spec(module_name: str):
+def _safe_find_spec(module_name: str) -> ModuleSpec | None:
     try:
         return importlib.util.find_spec(module_name)
     except Exception:
@@ -167,7 +168,7 @@ def _run_uv_sync(uv_path: str, project_root: Path, reporter: Reporter) -> CheckR
         text=True,
     )
     if result.returncode != 0:
-        retry = [*command, "--system-certs"]
+        retry = [command[0], "--system-certs", *command[1:]]
         reporter("uv sync failed; retrying with --system-certs")
         reporter(f"+ {' '.join(retry)}")
         result = subprocess.run(

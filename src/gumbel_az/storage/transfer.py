@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 from gumbel_az.replay.codec import decode_samples
 from gumbel_az.replay.schema import SCHEMA_VERSION
@@ -67,10 +68,10 @@ def _copy_file_to_temp(source: Path, directory: Path, *, prefix: str) -> Path:
     return temp_path
 
 
-def _load_json(path: Path, default: dict) -> dict:
+def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,7 @@ class ReplayTransfer:
             validate_sample(sample)
         return len(samples)
 
-    def _next_shard_path(self, index: dict) -> Path:
+    def _next_shard_path(self, index: dict[str, Any]) -> Path:
         shard_id = len(index["shards"]) + 1
         while True:
             candidate = self.shards_dir / f"shard_{shard_id:09d}.msgpack.zst"
@@ -147,7 +148,7 @@ class ReplayTransfer:
             staging.unlink(missing_ok=True)
             raise
         entry = {
-            "path": str(destination.resolve()),
+            "path": destination.relative_to(self.replay_dir).as_posix(),
             "samples": sample_count,
             "created_at": timestamp,
             "uploaded_by": worker_id,
@@ -172,7 +173,14 @@ class CheckpointSync:
         metadata = _load_json(pointer_path, {})
         if "path" not in metadata:
             raise FileNotFoundError(pointer_path)
-        source_checkpoint = Path(metadata["path"])
+        stored_path = Path(metadata["path"])
+        source_checkpoint = (
+            stored_path.resolve()
+            if stored_path.is_absolute()
+            else (source_root / stored_path).resolve()
+        )
+        if not source_checkpoint.is_relative_to(source_root.resolve()):
+            raise ValueError(f"checkpoint path escapes source root: {metadata['path']}")
         if not source_checkpoint.exists():
             raise FileNotFoundError(source_checkpoint)
         destination_root.mkdir(parents=True, exist_ok=True)
@@ -191,6 +199,6 @@ class CheckpointSync:
                 if staging.exists():
                     shutil.rmtree(staging)
                 raise
-        local_metadata = {**metadata, "path": str(destination.resolve())}
+        local_metadata = {**metadata, "path": destination.name}
         atomic_write_json(destination_root / f"{pointer}.json", local_metadata)
         return destination

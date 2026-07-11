@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
+import json
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
+from typing import Any
 
 import numpy as np
 import torch
@@ -37,7 +41,7 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _sample_age_seconds(samples: list[dict]) -> float:
+def _sample_age_seconds(samples: list[dict[str, Any]]) -> float:
     ages = []
     now = _utc_now()
     for sample in samples:
@@ -59,6 +63,15 @@ def _checkpoint_model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tens
     return model.state_dict()
 
 
+def _config_hash(config: AppConfig) -> str:
+    payload = json.dumps(
+        config.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _maybe_compile_model(
     model: torch.nn.Module,
     *,
@@ -76,6 +89,8 @@ def _maybe_compile_model(
         should_compile = device.type == "cuda" and not is_debug_run and sys.platform != "darwin"
     if not should_compile:
         return model, "eager"
+    if device.type == "cuda" and importlib.util.find_spec("triton") is None:
+        return model, "fallback" if compile_policy == "on" else "eager"
     try:
         compiled = torch.compile(model, mode="reduce-overhead")
     except Exception:
@@ -127,8 +142,31 @@ class Trainer:
             device=self.device,
             run_name=config.run.name,
         )
+        if compile_mode == "compiled":
+            try:
+                self.model.eval()
+                warmup = torch.zeros(
+                    (1, *self.game.observation_shape),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                with torch.inference_mode():
+                    self.model(warmup)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+            except Exception:
+                original = _compiled_original_model(self.model)
+                if original is None:
+                    raise
+                self.model = original
+                compile_mode = "fallback"
         self.optimizer, self.schedule = create_optimizer(self.model, config.training)
-        scaler = torch.amp.GradScaler("cuda") if self.device.type == "cuda" else None
+        scaler_factory = getattr(torch.amp, "GradScaler", None)
+        scaler = (
+            scaler_factory("cuda")
+            if self.device.type == "cuda" and scaler_factory is not None
+            else None
+        )
         self.state = TorchTrainState(
             model=self.model,
             optimizer=self.optimizer,
@@ -140,7 +178,7 @@ class Trainer:
             compile_mode=compile_mode,
         )
 
-    def load_checkpoint(self, checkpoint: dict) -> None:
+    def load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         state = checkpoint.get("state", {})
         model_state = state.get("model_state_dict")
         if not isinstance(model_state, dict):
@@ -152,6 +190,17 @@ class Trainer:
         scaler_state = state.get("scaler_state_dict")
         if self.state.scaler is not None and isinstance(scaler_state, dict):
             self.state.scaler.load_state_dict(scaler_state)
+        scheduler_state = state.get("scheduler_state_dict")
+        if isinstance(scheduler_state, dict):
+            self.state.schedule.base_lr = float(
+                scheduler_state.get("base_lr", self.state.schedule.base_lr)
+            )
+            self.state.schedule.warmup_steps = int(
+                scheduler_state.get("warmup_steps", self.state.schedule.warmup_steps)
+            )
+            self.state.schedule.total_steps = int(
+                scheduler_state.get("total_steps", self.state.schedule.total_steps)
+            )
         self.state.step = int(state.get("step", checkpoint.get("metadata", {}).get("version", 0)))
 
     def _fallback_state_to_eager(self, state: TorchTrainState) -> TorchTrainState:
@@ -165,7 +214,12 @@ class Trainer:
             optimizer.load_state_dict(optimizer_state)
         except ValueError:
             pass
-        scaler = torch.amp.GradScaler("cuda") if state.device.type == "cuda" else None
+        scaler_factory = getattr(torch.amp, "GradScaler", None)
+        scaler = (
+            scaler_factory("cuda")
+            if state.device.type == "cuda" and scaler_factory is not None
+            else None
+        )
         if scaler is not None and scaler_state is not None:
             scaler.load_state_dict(scaler_state)
         return TorchTrainState(
@@ -186,6 +240,11 @@ class Trainer:
             state={
                 "model_state_dict": _checkpoint_model_state_dict(state.model),
                 "optimizer_state_dict": state.optimizer.state_dict(),
+                "scheduler_state_dict": {
+                    "base_lr": state.schedule.base_lr,
+                    "warmup_steps": state.schedule.warmup_steps,
+                    "total_steps": state.schedule.total_steps,
+                },
                 "step": state.step,
                 "scaler_state_dict": None if state.scaler is None else state.scaler.state_dict(),
             },
@@ -197,13 +256,14 @@ class Trainer:
                 "runtime": "torch",
                 "device": str(self.device),
                 "compile_mode": state.compile_mode,
+                "config_hash": _config_hash(self.config),
             },
         )
         return checkpoint_version
 
-    def _augmented_samples(self) -> list[dict]:
+    def _augmented_samples(self) -> list[dict[str, Any]]:
         samples = self.replay_sampler.samples()
-        augmented: list[dict] = []
+        augmented: list[dict[str, Any]] = []
         for sample in samples:
             augmented.extend(self.game.symmetries(sample))
         return augmented
@@ -248,6 +308,7 @@ class Trainer:
                         "total_loss": latest_metrics["total_loss"],
                         "learning_rate": latest_metrics["learning_rate"],
                         "grad_norm": latest_metrics["grad_norm"],
+                        "amp_overflow": latest_metrics["amp_overflow"],
                         "replay_sample_age_mean": replay_age,
                         "compile_mode": state.compile_mode,
                     },

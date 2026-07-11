@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
+from typing import Any
 from uuid import uuid4
 
 import numpy as np
@@ -58,14 +59,15 @@ class SelfPlayWorker:
         self.device = torch.device(device)
         self.game = create_game(config.game.name)
         self.network = create_network(config.model, num_actions=self.game.num_actions)
-        self.model = model
-        if self.model is None:
-            self.model = self.network.init(
+        resolved_model = model
+        if resolved_model is None:
+            resolved_model = self.network.init(
                 config.run.seed,
                 self.game.observation_shape,
                 self.game.num_actions,
                 device=self.device,
             )
+        self.model: torch.nn.Module = resolved_model
         self.model.to(self.device)
         self.model.eval()
         self.algorithm = create_algorithm(
@@ -76,7 +78,7 @@ class SelfPlayWorker:
         self.replay_writer = replay_writer
         self.model_version = 0
 
-    def _network_apply(self, observations: torch.Tensor):
+    def _network_apply(self, observations: torch.Tensor) -> Any:
         self.model.eval()
         return self.model(observations.to(self.device, non_blocking=True))
 
@@ -160,8 +162,8 @@ class SelfPlayWorker:
         start = perf_counter()
         trajectories = []
         samples = []
-        entropies = []
-        root_values = []
+        entropies: list[float] = []
+        root_values: list[float] = []
         for index in range(num_games):
             trajectory = self.play_game(seed + index)
             trajectories.append(trajectory)

@@ -48,7 +48,7 @@ def create_run_directory(config: AppConfig, *, base_dir: Path | None = None) -> 
         root / "latest.json",
         {
             "run_id": run_id,
-            "run_dir": str(run_dir),
+            "run_dir": run_id,
             "created_at": timestamp,
         },
     )

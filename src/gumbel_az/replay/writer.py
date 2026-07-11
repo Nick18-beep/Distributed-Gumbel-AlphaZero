@@ -7,7 +7,7 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from gumbel_az.replay.codec import encode_samples
 from gumbel_az.replay.schema import SCHEMA_VERSION
@@ -22,7 +22,7 @@ def _utc_now() -> str:
 def _load_index(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"schema_version": SCHEMA_VERSION, "shards": [], "total_samples": 0}
-    return json.loads(path.read_text(encoding="utf-8"))
+    return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
 
 
 class ReplayWriter:
@@ -90,7 +90,7 @@ class ReplayWriter:
             raise
 
         entry = {
-            "path": str(destination.resolve()),
+            "path": destination.relative_to(self.replay_dir).as_posix(),
             "samples": len(normalized),
             "created_at": _utc_now(),
         }

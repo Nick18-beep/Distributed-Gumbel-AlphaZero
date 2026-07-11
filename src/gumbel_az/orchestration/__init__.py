@@ -1,5 +1,7 @@
 """Run orchestration."""
 
+from typing import Any
+
 from gumbel_az.orchestration.resume import (
     ResumeContext,
     load_resume_context,
@@ -20,7 +22,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     if name == "RunOrchestrator":
         from gumbel_az.orchestration.run import RunOrchestrator
 

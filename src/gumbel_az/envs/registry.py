@@ -35,4 +35,4 @@ def _ensure_builtin_games() -> None:
     if "connect_four" not in _REGISTRY:
         from gumbel_az.envs.custom.connect_four import ConnectFourGame
 
-        register_game("connect_four", ConnectFourGame)
+        register_game("connect_four", lambda: ConnectFourGame())

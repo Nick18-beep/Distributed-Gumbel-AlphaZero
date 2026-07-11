@@ -70,6 +70,8 @@ def test_single_process_backend_initializes_run(tmp_path: Path) -> None:
     events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
     assert '"event": "training_completed"' in events
     assert '"train_step": 2' in events
+    metrics = (result.run_dir / "logs" / "metrics.jsonl").read_text(encoding="utf-8")
+    assert '"amp_overflow": 0.0' in metrics
 
 
 def test_single_process_backend_rejects_other_backend(tmp_path: Path) -> None:
@@ -88,6 +90,37 @@ def test_single_process_backend_rejects_other_backend(tmp_path: Path) -> None:
         assert "local_multiprocess" in str(exc)
     else:
         raise AssertionError("expected backend mismatch to fail")
+
+
+def test_orchestrator_records_failed_state_and_event(tmp_path: Path) -> None:
+    config = load_config(DEBUG_CONFIG, [f"run.output_dir={tmp_path.as_posix()}"])
+    paths = create_run_directory(config)
+    orchestrator = RunOrchestrator(
+        config,
+        paths=paths,
+        runtime_backend=RuntimeBackend(
+            name="none",
+            torch_available=False,
+            device="none",
+            device_count=0,
+            reason="test runtime unavailable",
+        ),
+        event_writer=JsonlWriter(paths.events_path),
+        metric_writer=MetricWriter(paths.metrics_path),
+    )
+
+    try:
+        orchestrator.run()
+    except RuntimeError as exc:
+        assert "test runtime unavailable" in str(exc)
+    else:
+        raise AssertionError("expected unavailable runtime to fail")
+
+    state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))
+    events = paths.events_path.read_text(encoding="utf-8")
+    assert state["status"] == "failed"
+    assert state["error"]["type"] == "RuntimeError"
+    assert '"event": "run_failed"' in events
 
 
 def test_single_process_backend_runs_multiple_iterations(tmp_path: Path) -> None:

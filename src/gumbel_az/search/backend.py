@@ -14,6 +14,7 @@ from gumbel_az.search.outputs import SearchOutput
 
 class SearchBackend(Protocol):
     name: str
+    device: torch.device
 
     def search(
         self,

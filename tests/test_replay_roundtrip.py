@@ -170,6 +170,19 @@ def test_replay_index_paths_survive_cwd_change(tmp_path: Path, monkeypatch) -> N
     assert len(samples) == 1
 
 
+def test_replay_index_is_portable_when_directory_moves(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "replay"
+    ReplayWriter(source).write_shard([_sample(0)])
+    moved = tmp_path / "moved" / "replay"
+    moved.parent.mkdir()
+    source.rename(moved)
+
+    index = json.loads((moved / "index.json").read_text(encoding="utf-8"))
+
+    assert index["shards"][0]["path"] == "shards/shard_000000001.msgpack.zst"
+    assert len(ReplayReader(moved).read_all()) == 1
+
+
 def test_replay_rejects_schema_version_mismatch(tmp_path: Path) -> None:
     writer = ReplayWriter(tmp_path / "replay")
     bad = {"schema_version": 999, "timestamp": "now", **_sample(0)}
@@ -228,6 +241,9 @@ def test_corrupted_shard_is_quarantined(tmp_path: Path) -> None:
 
     assert not shard.exists()
     assert list((replay_dir / "quarantine").iterdir())
+    index = json.loads((replay_dir / "index.json").read_text(encoding="utf-8"))
+    assert index["shards"] == []
+    assert index["total_samples"] == 0
 
 
 def test_replay_codec_schema_version_mismatch_on_read(tmp_path: Path) -> None:

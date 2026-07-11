@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 
@@ -14,6 +14,7 @@ from gumbel_az.config.schema import AppConfig
 from gumbel_az.envs import create_game
 from gumbel_az.model import create_network
 from gumbel_az.model.checkpoint import CheckpointManager
+from gumbel_az.model.common import NetworkOutput
 from gumbel_az.runtime import detect_torch_runtime
 from gumbel_az.search import TorchGumbelSearchBackend
 
@@ -46,9 +47,12 @@ class AgentPlayer:
         generator = torch.Generator(device=self.device)
         generator.manual_seed(seed)
 
-        def network_apply(observations):
+        def network_apply(observations: torch.Tensor) -> NetworkOutput:
             self.model.eval()
-            return self.model(observations.to(self.device, non_blocking=True))
+            return cast(
+                NetworkOutput,
+                self.model(observations.to(self.device, non_blocking=True)),
+            )
 
         output = self.algorithm.select_action(
             game_state=state,
@@ -105,6 +109,7 @@ def select_agent_action(
 
 
 def result_message(game: Any, state: Any, *, human_player: int) -> str:
+    validate_human_player(game, human_player)
     if not bool(game.is_terminal(state)):
         return "partita in corso"
     reward = float(game.rewards(state)[human_player])
@@ -122,6 +127,14 @@ def apply_human_action(game: Any, state: Any, action: int) -> Any:
     return game.step(state, action)
 
 
+def validate_human_player(game: Any, human_player: int) -> None:
+    if human_player < 0 or human_player >= game.num_players:
+        raise ValueError(
+            f"human player {human_player} out of range for {game.name} "
+            f"(expected 0..{game.num_players - 1})"
+        )
+
+
 def play_scripted_game(
     config: AppConfig,
     *,
@@ -131,6 +144,7 @@ def play_scripted_game(
     human_player: int = 0,
 ) -> PlayResult:
     game = create_game(config.game.name)
+    validate_human_player(game, human_player)
     model = load_play_model(config, run_dir=run_dir, checkpoint=checkpoint)
     agent = AgentPlayer(config, model=model)
     state = game.init(config.run.seed)

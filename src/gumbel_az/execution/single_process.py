@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from gumbel_az.config.loader import save_resolved_config
 from gumbel_az.config.schema import AppConfig
 from gumbel_az.execution.base import ExecutionResult
@@ -37,7 +39,7 @@ class SingleProcessExecutionBackend:
             metric_writer=metric_writer,
         ).run()
 
-    def resume(self, config: AppConfig, run_dir) -> ExecutionResult:
+    def resume(self, config: AppConfig, run_dir: Path) -> ExecutionResult:
         if config.execution.backend != self.name:
             raise ValueError(
                 f"SingleProcessExecutionBackend cannot run backend {config.execution.backend!r}"

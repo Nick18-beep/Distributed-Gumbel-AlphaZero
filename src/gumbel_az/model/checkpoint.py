@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -28,8 +28,16 @@ def _entry_for_version(index_path: Path, version: int) -> dict[str, Any]:
     index = _load_json(index_path, {"checkpoints": []})
     for entry in index["checkpoints"]:
         if entry["version"] == version:
-            return entry
+            return cast(dict[str, Any], entry)
     raise FileNotFoundError(f"checkpoint version {version} is not registered")
+
+
+def _resolve_checkpoint_path(root: Path, stored_path: str | Path) -> Path:
+    path = Path(stored_path)
+    resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise ValueError(f"checkpoint path escapes checkpoint root: {stored_path}")
+    return resolved
 
 
 class CheckpointManager:
@@ -78,7 +86,7 @@ class CheckpointManager:
 
         entry = {
             "version": version,
-            "path": str(final_dir.resolve()),
+            "path": final_dir.name,
             "metadata": payload["metadata"],
         }
         index = _load_json(self.index_path, {"checkpoints": []})
@@ -102,18 +110,21 @@ class CheckpointManager:
             pointer = _load_json(self.best_path, None)
             if pointer is None:
                 raise FileNotFoundError(self.best_path)
-            checkpoint_dir = Path(pointer["path"])
+            checkpoint_dir = _resolve_checkpoint_path(self.root, pointer["path"])
         elif version is None:
             pointer = _load_json(self.latest_path, None)
             if pointer is None:
                 raise FileNotFoundError(self.latest_path)
-            checkpoint_dir = Path(pointer["path"])
+            checkpoint_dir = _resolve_checkpoint_path(self.root, pointer["path"])
         else:
-            checkpoint_dir = Path(_entry_for_version(self.index_path, version)["path"])
+            checkpoint_dir = _resolve_checkpoint_path(
+                self.root,
+                _entry_for_version(self.index_path, version)["path"],
+            )
         checkpoint_file = checkpoint_dir / "checkpoint.pt"
         if not checkpoint_file.exists():
             raise FileNotFoundError(checkpoint_file)
-        return torch.load(checkpoint_file, map_location=map_location, weights_only=False)
+        return torch.load(checkpoint_file, map_location=map_location, weights_only=True)
 
     def promote(self, version: int) -> None:
         entry = _entry_for_version(self.index_path, version)

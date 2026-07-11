@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
+from typing import Any
 
 import torch
 
 from gumbel_az.config import load_config
+from gumbel_az.config.schema import AppConfig
 from gumbel_az.envs import create_game
 from gumbel_az.eval import Arena
 from gumbel_az.logging import JsonlWriter
@@ -24,13 +27,13 @@ from gumbel_az.training.train_state import TorchTrainState, train_step
 from gumbel_az.training.trainer import Trainer
 
 
-def _write_jsonl(path: Path, payload: dict) -> None:
+def _write_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def benchmark_training(config_path: Path, *, output: Path) -> dict:
+def benchmark_training(config_path: Path, *, output: Path) -> dict[str, Any]:
     config = load_config(config_path)
     runtime = detect_torch_runtime()
     device = torch.device(runtime.device)
@@ -38,13 +41,16 @@ def benchmark_training(config_path: Path, *, output: Path) -> dict:
     network = create_network(config.model, num_actions=game.num_actions)
     model = network.init(config.run.seed, game.observation_shape, game.num_actions, device=device)
     optimizer, schedule = create_optimizer(model, config.training)
+    scaler_factory = getattr(torch.amp, "GradScaler", None)
     state = TorchTrainState(
         model=model,
         optimizer=optimizer,
         schedule=schedule,
         step=0,
         device=device,
-        scaler=torch.amp.GradScaler("cuda") if device.type == "cuda" else None,
+        scaler=scaler_factory("cuda")
+        if device.type == "cuda" and scaler_factory is not None
+        else None,
     )
     batch = {
         "observation": torch.zeros(
@@ -79,9 +85,7 @@ def benchmark_training(config_path: Path, *, output: Path) -> dict:
         "device": runtime.device,
         "steps": config.training.steps_per_iteration,
         "batch_size": config.training.batch_size,
-        "samples_per_sec": (
-            config.training.steps_per_iteration * config.training.batch_size
-        )
+        "samples_per_sec": (config.training.steps_per_iteration * config.training.batch_size)
         / max(elapsed, 1.0e-9),
         "seconds": elapsed,
         "total_loss": metrics["total_loss"],
@@ -90,50 +94,56 @@ def benchmark_training(config_path: Path, *, output: Path) -> dict:
     return payload
 
 
-def benchmark_selfplay(config_path: Path, *, output: Path) -> dict:
+def benchmark_selfplay(config_path: Path, *, output: Path) -> dict[str, Any]:
     config = load_config(config_path)
-    paths = create_run_directory(config)
-    worker = SelfPlayWorker(config, replay_writer=ReplayWriter(paths.run_dir / "replay"))
-    _, result = worker.play_batch(config.selfplay.games_per_iteration, config.run.seed)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="gaz-benchmark-selfplay-", dir=output.parent) as temporary:
+        worker = SelfPlayWorker(
+            config,
+            replay_writer=ReplayWriter(Path(temporary) / "replay"),
+        )
+        _, result = worker.play_batch(config.selfplay.games_per_iteration, config.run.seed)
     payload = {
         "benchmark": "selfplay",
         "games": result.games,
         "positions": result.positions,
         "games_per_sec": result.games_per_sec,
         "positions_per_sec": result.positions_per_sec,
-        "replay_shard": result.replay_shard,
+        "replay_shard_name": Path(result.replay_shard).name,
     }
     _write_jsonl(output, payload)
     return payload
 
 
-def benchmark_end_to_end(config_path: Path, *, output: Path) -> dict:
+def benchmark_end_to_end(config_path: Path, *, output: Path) -> dict[str, Any]:
     config = load_config(config_path)
-    paths = create_run_directory(config)
-    replay_writer = ReplayWriter(paths.run_dir / "replay")
-    worker = SelfPlayWorker(config, replay_writer=replay_writer)
-    _, selfplay = worker.play_batch(config.selfplay.games_per_iteration, config.run.seed)
-    checkpoint_manager = CheckpointManager(paths.run_dir / "checkpoints")
-    trainer = Trainer(
-        config,
-        replay_reader=ReplayReader(paths.run_dir / "replay"),
-        checkpoint_manager=checkpoint_manager,
-    )
-    train = trainer.run(max_steps=config.training.steps_per_iteration)
-    eval_result = Arena(config, eval_dir=paths.run_dir / "eval").evaluate_vs_random(
-        model=train.state.model,
-        checkpoint_version=train.checkpoint_version,
-    )
-    JsonlWriter(paths.logs_dir / "benchmark.jsonl").write(
-        {
-            "selfplay_games": selfplay.games,
-            "train_step": train.checkpoint_version,
-            "eval_win_rate": eval_result.win_rate,
-        }
-    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="gaz-benchmark-e2e-", dir=output.parent) as temporary:
+        paths = create_run_directory(config, base_dir=Path(temporary))
+        replay_writer = ReplayWriter(paths.run_dir / "replay")
+        worker = SelfPlayWorker(config, replay_writer=replay_writer)
+        _, selfplay = worker.play_batch(config.selfplay.games_per_iteration, config.run.seed)
+        checkpoint_manager = CheckpointManager(paths.run_dir / "checkpoints")
+        trainer = Trainer(
+            config,
+            replay_reader=ReplayReader(paths.run_dir / "replay"),
+            checkpoint_manager=checkpoint_manager,
+        )
+        train = trainer.run(max_steps=config.training.steps_per_iteration)
+        eval_result = Arena(config, eval_dir=paths.run_dir / "eval").evaluate_vs_random(
+            model=train.state.model,
+            checkpoint_version=train.checkpoint_version,
+        )
+        JsonlWriter(paths.logs_dir / "benchmark.jsonl").write(
+            {
+                "selfplay_games": selfplay.games,
+                "train_step": train.checkpoint_version,
+                "eval_win_rate": eval_result.win_rate,
+            }
+        )
     payload = {
         "benchmark": "end_to_end",
-        "run_dir": str(paths.run_dir),
+        "workspace_temporary": True,
         "selfplay_games_per_sec": selfplay.games_per_sec,
         "train_samples_per_sec": train.samples_per_sec,
         "eval_games_per_sec": eval_result.games_per_sec,
@@ -142,19 +152,22 @@ def benchmark_end_to_end(config_path: Path, *, output: Path) -> dict:
     return payload
 
 
-def run_benchmark(config, *, output_dir: Path | None = None) -> Path:
-    output_root = output_dir or Path("artifacts/benchmarks")
-    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%fZ")
-    output = output_root / f"benchmark_{stamp}.jsonl"
+def _run_benchmark_in_workspace(
+    config: AppConfig,
+    *,
+    output: Path,
+    workspace_root: Path,
+) -> None:
     runtime = detect_torch_runtime()
-    paths = create_run_directory(config)
+    paths = create_run_directory(config, base_dir=workspace_root)
     _write_jsonl(
         output,
         {
             "benchmark": "metadata",
             "runtime": runtime.name,
             "device": runtime.device,
-            "run_dir": str(paths.run_dir),
+            "run_id": paths.run_id,
+            "workspace_temporary": True,
         },
     )
 
@@ -234,4 +247,17 @@ def run_benchmark(config, *, output_dir: Path | None = None) -> Path:
             "games_per_sec": eval_result.games_per_sec,
         },
     )
+
+
+def run_benchmark(config: AppConfig, *, output_dir: Path | None = None) -> Path:
+    output_root = output_dir or Path("artifacts/benchmarks")
+    output_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%fZ")
+    output = output_root / f"benchmark_{stamp}.jsonl"
+    with TemporaryDirectory(prefix=".gaz-benchmark-", dir=output_root) as temporary:
+        _run_benchmark_in_workspace(
+            config,
+            output=output,
+            workspace_root=Path(temporary),
+        )
     return output

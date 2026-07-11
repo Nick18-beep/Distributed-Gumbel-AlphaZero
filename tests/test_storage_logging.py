@@ -34,7 +34,8 @@ def test_run_directory_layout_and_latest_pointer(tmp_path: Path) -> None:
     assert paths.resolved_config_path.exists()
     latest = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
     assert latest["run_id"] == paths.run_id
-    assert Path(latest["run_dir"]) == paths.run_dir
+    assert latest["run_dir"] == paths.run_id
+    assert (tmp_path / latest["run_dir"]) == paths.run_dir
 
 
 def test_jsonl_event_and_metric_writers(tmp_path: Path) -> None:

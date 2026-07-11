@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 
@@ -40,7 +42,7 @@ class ResidualBlock(nn.Module):
         self.activation = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.activation(x + self.net(x))
+        return cast(torch.Tensor, self.activation(x + self.net(x)))
 
 
 class ResNetBoard(nn.Module):

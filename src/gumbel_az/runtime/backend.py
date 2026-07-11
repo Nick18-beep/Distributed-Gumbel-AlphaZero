@@ -15,6 +15,7 @@ class RuntimeBackend:
     device_count: int
     reason: str
 
+
 def _can_import(module_name: str) -> tuple[bool, str]:
     try:
         spec = importlib.util.find_spec(module_name)

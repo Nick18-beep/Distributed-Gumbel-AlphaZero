@@ -60,7 +60,14 @@ def load_replay_index(run_dir: Path) -> dict[str, Any]:
     seen_paths: set[Path] = set()
     total_samples = 0
     for entry in data["shards"]:
-        path = Path(entry["path"]).resolve()
+        stored_path = Path(entry["path"])
+        path = (
+            stored_path.resolve()
+            if stored_path.is_absolute()
+            else (run_dir / "replay" / stored_path).resolve()
+        )
+        if not path.is_relative_to((run_dir / "replay").resolve()):
+            raise ValueError(f"replay shard path escapes replay directory: {entry['path']}")
         if path in seen_paths:
             raise ValueError(f"duplicate replay shard in index: {path}")
         if not path.exists():
@@ -83,8 +90,15 @@ def _load_pointer(path: Path) -> dict[str, Any] | None:
     return data
 
 
-def _validate_checkpoint_pointer(pointer: dict[str, Any]) -> None:
-    checkpoint_dir = Path(pointer["path"])
+def _validate_checkpoint_pointer(pointer: dict[str, Any], checkpoint_root: Path) -> None:
+    stored_path = Path(pointer["path"])
+    checkpoint_dir = (
+        stored_path.resolve()
+        if stored_path.is_absolute()
+        else (checkpoint_root / stored_path).resolve()
+    )
+    if not checkpoint_dir.is_relative_to(checkpoint_root.resolve()):
+        raise ValueError(f"checkpoint path escapes checkpoint root: {pointer['path']}")
     if not checkpoint_dir.exists():
         raise FileNotFoundError(checkpoint_dir)
     required = ("checkpoint.pt",)
@@ -103,7 +117,7 @@ def load_checkpoint_pointers(run_dir: Path) -> tuple[dict[str, Any] | None, dict
     best = _load_pointer(manager.best_path)
     for pointer in (latest, best):
         if pointer is not None:
-            _validate_checkpoint_pointer(pointer)
+            _validate_checkpoint_pointer(pointer, manager.root)
     return latest, best
 
 
@@ -125,7 +139,7 @@ def rebuild_replay_index(run_dir: Path) -> dict[str, Any]:
             continue
         entries.append(
             {
-                "path": str(shard.resolve()),
+                "path": shard.relative_to(replay_dir).as_posix(),
                 "samples": len(samples),
                 "created_at": _utc_now(),
             }

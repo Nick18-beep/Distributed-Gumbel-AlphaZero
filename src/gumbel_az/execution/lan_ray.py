@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
+import shutil
 import socket
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -113,9 +116,9 @@ class ConsoleEventWriter(JsonlWriter):
             print(message, flush=True)
 
 
-def _require_ray():
+def _require_ray() -> Any:
     try:
-        import ray  # type: ignore[import-not-found]
+        import ray
     except ModuleNotFoundError as exc:
         raise RuntimeError("Ray is not installed; run `uv sync --extra distributed`.") from exc
     except Exception as exc:
@@ -147,8 +150,8 @@ def detect_worker_capabilities(worker_id: str | None = None) -> WorkerCapabiliti
 
 @dataclass(frozen=True)
 class HeadSnapshot:
-    workers: dict[str, dict]
-    tasks: dict[str, dict]
+    workers: dict[str, dict[str, Any]]
+    tasks: dict[str, dict[str, Any]]
     commands: dict[str, list[str]]
 
 
@@ -171,10 +174,10 @@ class HeadController:
         self.checkpoint_sync = CheckpointSync(run_dir / "checkpoints")
         self.event_writer = event_writer
 
-    def register_worker(self, capabilities: WorkerCapabilities) -> dict:
+    def register_worker(self, capabilities: WorkerCapabilities) -> dict[str, Any]:
         return self.heartbeat.register(capabilities).to_json()
 
-    def worker_heartbeat(self, worker_id: str, *, status: str = "idle") -> dict:
+    def worker_heartbeat(self, worker_id: str, *, status: str = "idle") -> dict[str, Any]:
         return self.heartbeat.heartbeat(worker_id, status=status).to_json()
 
     def submit_task(
@@ -183,10 +186,10 @@ class HeadController:
         payload: dict[str, Any],
         *,
         task_id: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         return self.leases.submit(task_type, payload, task_id=task_id).to_json()
 
-    def acquire_task(self, worker_id: str) -> dict | None:
+    def acquire_task(self, worker_id: str) -> dict[str, Any] | None:
         self.heartbeat.get(worker_id)
         record = self.leases.acquire(worker_id)
         if record is None:
@@ -194,13 +197,19 @@ class HeadController:
         self.heartbeat.heartbeat(worker_id, status="busy")
         return record.to_json()
 
-    def complete_task(self, worker_id: str, task_id: str, lease_id: str) -> dict:
+    def complete_task(self, worker_id: str, task_id: str, lease_id: str) -> dict[str, Any]:
         self.heartbeat.get(worker_id)
         record = self.leases.complete(task_id, lease_id, worker_id=worker_id)
         self.heartbeat.heartbeat(worker_id, status="idle")
         return record.to_json()
 
-    def fail_task(self, worker_id: str, task_id: str, lease_id: str, error: str) -> dict:
+    def fail_task(
+        self,
+        worker_id: str,
+        task_id: str,
+        lease_id: str,
+        error: str,
+    ) -> dict[str, Any]:
         self.heartbeat.get(worker_id)
         record = self.leases.fail(task_id, lease_id, error, retry=True, worker_id=worker_id)
         self.heartbeat.heartbeat(worker_id, status="idle")
@@ -211,7 +220,7 @@ class HeadController:
         expired = self.leases.expire_leases()
         return {"lost_workers": lost, "expired_tasks": [task.task_id for task in expired]}
 
-    def upload_replay_shard(self, worker_id: str, shard_path: str) -> dict:
+    def upload_replay_shard(self, worker_id: str, shard_path: str) -> dict[str, Any]:
         source = Path(shard_path)
         size_bytes = source.stat().st_size if source.exists() else 0
         started = perf_counter()
@@ -283,11 +292,14 @@ class WorkerActorCore:
         checkpoint_payload_bytes: bytes | None = None,
     ) -> dict[str, Any]:
         config = AppConfig.model_validate(config_data)
+        temporary_work_dir = work_dir is None
         if work_dir is None:
             root = Path(tempfile.gettempdir()) / "gumbel_az_ray_workers"
         else:
             root = Path(work_dir)
-        replay_dir = root / self.capabilities.worker_id / f"slot_{worker_slot:03d}" / "replay"
+        worker_root = root / self.capabilities.worker_id
+        slot_root = worker_root / f"slot_{worker_slot:03d}"
+        replay_dir = slot_root / "replay"
         runtime = detect_runtime_backend()
         if runtime.name != "torch":
             raise RuntimeError(runtime.reason)
@@ -315,12 +327,13 @@ class WorkerActorCore:
             checkpoint = torch.load(
                 BytesIO(checkpoint_payload_bytes),
                 map_location=selected_device,
-                weights_only=False,
+                weights_only=True,
             )
             worker.model.load_state_dict(checkpoint["state"]["model_state_dict"])
             worker.model_version = int(checkpoint.get("metadata", {}).get("version", 0))
         _, result = worker.play_batch(games, seed)
         shard_path = Path(result.replay_shard)
+        shard_bytes = shard_path.read_bytes()
         print(
             "[gaz-worker] self-play completed "
             f"worker={self.capabilities.worker_id} "
@@ -328,19 +341,27 @@ class WorkerActorCore:
             f"games_per_sec={result.games_per_sec:.3f}",
             flush=True,
         )
-        return {
+        payload = {
             "worker_id": self.capabilities.worker_id,
             "worker_slot": worker_slot,
             "runtime_backend": runtime.name,
             "device": str(selected_device),
             "replay_shard": result.replay_shard,
             "replay_shard_name": shard_path.name,
-            "replay_shard_bytes": shard_path.read_bytes(),
+            "replay_shard_bytes": shard_bytes,
             "games": result.games,
             "positions": result.positions,
             "games_per_sec": result.games_per_sec,
             "positions_per_sec": result.positions_per_sec,
         }
+        if temporary_work_dir:
+            shutil.rmtree(slot_root, ignore_errors=True)
+            for directory in (worker_root, root):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    break
+        return payload
 
     def download_checkpoint(self, source_root: Path, destination_root: Path, pointer: str) -> str:
         synced = CheckpointSync(destination_root).sync_pointer(
@@ -351,7 +372,7 @@ class WorkerActorCore:
         return str(synced)
 
 
-def make_ray_head_actor():
+def make_ray_head_actor() -> Any:
     ray = _require_ray()
 
     @ray.remote
@@ -361,7 +382,7 @@ def make_ray_head_actor():
     return RayHeadController
 
 
-def make_ray_worker_actor():
+def make_ray_worker_actor() -> Any:
     ray = _require_ray()
 
     @ray.remote
@@ -385,11 +406,7 @@ def _remote_ray_nodes(ray: Any) -> list[dict[str, Any]]:
     current_node_id = _current_ray_node_id(ray, alive_nodes)
     if current_node_id is None:
         return []
-    return [
-        node
-        for node in alive_nodes
-        if str(node.get("NodeID", "")) != current_node_id
-    ]
+    return [node for node in alive_nodes if str(node.get("NodeID", "")) != current_node_id]
 
 
 def _selfplay_ray_nodes(ray: Any, *, include_head: bool) -> list[tuple[dict[str, Any], bool]]:
@@ -446,14 +463,74 @@ def _ray_node_cpu_count(node: dict[str, Any]) -> int:
 
 
 def _checkpoint_payload_bytes(run_dir: Path) -> bytes | None:
-    latest = run_dir / "checkpoints" / "latest.json"
+    checkpoint_root = (run_dir / "checkpoints").resolve()
+    latest = checkpoint_root / "latest.json"
     if not latest.exists():
         return None
     pointer = json.loads(latest.read_text(encoding="utf-8"))
-    checkpoint_file = Path(pointer["path"]) / "checkpoint.pt"
+    stored_path = Path(pointer["path"])
+    checkpoint_dir = (
+        stored_path.resolve()
+        if stored_path.is_absolute()
+        else (checkpoint_root / stored_path).resolve()
+    )
+    if not checkpoint_dir.is_relative_to(checkpoint_root):
+        raise ValueError(f"checkpoint path escapes checkpoint root: {pointer['path']}")
+    checkpoint_file = checkpoint_dir / "checkpoint.pt"
     if not checkpoint_file.exists():
         return None
     return checkpoint_file.read_bytes()
+
+
+def _put_shared_argument(ray: Any, value: Any, *, shared: bool) -> Any:
+    put = getattr(ray, "put", None)
+    return put(value) if shared and callable(put) else value
+
+
+def _ready_futures(
+    ray: Any,
+    futures: list[Any],
+    *,
+    timeout_sec: float | None = None,
+) -> Iterator[tuple[int, Any]]:
+    """Return futures in completion order when the Ray API is available."""
+    wait = getattr(ray, "wait", None)
+    if not callable(wait):
+        yield from enumerate(futures)
+        return
+    pending = list(enumerate(futures))
+    deadline = None if timeout_sec is None else perf_counter() + timeout_sec
+    while pending:
+        timeout = None if deadline is None else max(0.0, deadline - perf_counter())
+        ready, _ = wait(
+            [future for _, future in pending],
+            num_returns=1,
+            timeout=timeout,
+        )
+        if not ready:
+            raise TimeoutError(f"timed out waiting for {len(pending)} Ray self-play worker(s)")
+        ready_future = ready[0]
+        position = next(
+            index for index, (_, future) in enumerate(pending) if future == ready_future
+        )
+        yield pending.pop(position)
+
+
+def _safe_upload_component(value: Any) -> str:
+    basename = re.split(r"[\\/]", str(value))[-1]
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", basename)
+    return safe.strip("._") or "item"
+
+
+def _kill_ray_actors(ray: Any, actors: list[Any]) -> None:
+    kill = getattr(ray, "kill", None)
+    if not callable(kill):
+        return
+    for actor in actors:
+        try:
+            kill(actor, no_restart=True)
+        except Exception:
+            continue
 
 
 class LanRayExecutionBackend:
@@ -580,29 +657,46 @@ class LanRayExecutionBackend:
                     }
                 )
             remote_stats["remote_workers_scheduled"] = len(actor_plan)
-            actors = []
-            for node, _, _, _ in actor_plan:
-                node_id = str(node.get("NodeID", ""))
-                actors.append(
-                    worker_actor.options(
-                        **_ray_node_affinity_options(node_id),
-                        num_cpus=1,
-                    ).remote()
-                )
             checkpoint_payload = _checkpoint_payload_bytes(paths.run_dir) if resume else None
             if checkpoint_payload is None and resume:
                 raise RuntimeError(
                     f"cannot resume {paths.run_dir}: latest checkpoint payload not found"
                 )
+            actors = []
+            try:
+                for node, _, _, _ in actor_plan:
+                    node_id = str(node.get("NodeID", ""))
+                    actors.append(
+                        worker_actor.options(
+                            **_ray_node_affinity_options(node_id),
+                            num_cpus=1,
+                            max_restarts=1,
+                            max_task_retries=1,
+                        ).remote()
+                    )
+            except Exception:
+                _kill_ray_actors(ray, actors)
+                raise
+            shared = len(actors) > 1
+            config_payload = _put_shared_argument(
+                ray,
+                config.model_dump(mode="json"),
+                shared=shared,
+            )
+            checkpoint_argument = _put_shared_argument(
+                ray,
+                checkpoint_payload,
+                shared=shared and checkpoint_payload is not None,
+            )
             futures = [
                 actor.generate_replay_shard.remote(
-                    config.model_dump(mode="json"),
+                    config_payload,
                     work_dir=None,
                     games=actor_games,
                     worker_slot=worker_slot,
                     seed=config.run.seed + 100_000 + index * 10_000,
                     device="cpu" if is_head else None,
-                    checkpoint_payload_bytes=checkpoint_payload,
+                    checkpoint_payload_bytes=checkpoint_argument,
                 )
                 for index, (actor, (_, is_head, worker_slot, actor_games)) in enumerate(
                     zip(actors, actor_plan, strict=True)
@@ -612,40 +706,61 @@ class LanRayExecutionBackend:
             head = HeadController(run_dir=paths.run_dir, event_writer=event_writer)
             upload_dir = paths.run_dir / "ray_uploads"
             upload_dir.mkdir(parents=True, exist_ok=True)
-            for index, future in enumerate(futures):
-                node = actor_plan[index][0]
-                try:
-                    payload = ray.get(future)
-                except Exception as exc:
+            try:
+                for index, future in _ready_futures(
+                    ray,
+                    futures,
+                    timeout_sec=config.stop.max_wall_time_sec,
+                ):
+                    node = actor_plan[index][0]
+                    try:
+                        payload = ray.get(future)
+                    except Exception as exc:
+                        event_writer.write(
+                            {
+                                "event": "lan_ray_remote_selfplay_failed",
+                                "ray_node_id": str(node.get("NodeID", "")),
+                                "ray_node_address": _ray_node_address(node),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        remote_stats["remote_workers_failed"] += 1
+                        continue
+                    shard_path = upload_dir / (
+                        f"{index:06d}_"
+                        f"{_safe_upload_component(payload['worker_id'])}_"
+                        f"{_safe_upload_component(payload['replay_shard_name'])}"
+                    )
+                    shard_path.write_bytes(payload.pop("replay_shard_bytes"))
+                    try:
+                        imported = head.upload_replay_shard(
+                            payload["worker_id"],
+                            str(shard_path),
+                        )
+                    finally:
+                        shard_path.unlink(missing_ok=True)
+                    remote_stats["remote_workers_completed"] += 1
+                    if imported.get("imported"):
+                        remote_stats["remote_games"] += int(payload.get("games", 0))
+                        remote_stats["remote_positions"] += int(payload.get("positions", 0))
+                        remote_stats["remote_replay_samples_imported"] += int(
+                            imported.get("samples", 0)
+                        )
                     event_writer.write(
                         {
-                            "event": "lan_ray_remote_selfplay_failed",
+                            "event": "lan_ray_remote_selfplay_completed",
+                            **payload,
                             "ray_node_id": str(node.get("NodeID", "")),
                             "ray_node_address": _ray_node_address(node),
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "imported": imported,
                         }
                     )
-                    remote_stats["remote_workers_failed"] += 1
-                    continue
-                shard_path = upload_dir / f"{payload['worker_id']}_{payload['replay_shard_name']}"
-                shard_path.write_bytes(payload.pop("replay_shard_bytes"))
-                imported = head.upload_replay_shard(payload["worker_id"], str(shard_path))
-                remote_stats["remote_workers_completed"] += 1
-                if imported.get("imported"):
-                    remote_stats["remote_games"] += int(payload.get("games", 0))
-                    remote_stats["remote_positions"] += int(payload.get("positions", 0))
-                    remote_stats["remote_replay_samples_imported"] += int(
-                        imported.get("samples", 0)
-                    )
-                event_writer.write(
-                    {
-                        "event": "lan_ray_remote_selfplay_completed",
-                        **payload,
-                        "ray_node_id": str(node.get("NodeID", "")),
-                        "ray_node_address": _ray_node_address(node),
-                        "imported": imported,
-                    }
-                )
+            finally:
+                try:
+                    upload_dir.rmdir()
+                except OSError:
+                    pass
+                _kill_ray_actors(ray, actors)
         elif not actor_nodes:
             event_writer.write(
                 {

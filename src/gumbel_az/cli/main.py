@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from time import monotonic, sleep
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, cast
 
 import typer
 from pydantic import ValidationError
@@ -113,6 +113,10 @@ def _reject_checkpoint_shape_overrides(overrides: list[str] | None) -> None:
 
 
 def _ray_cli_path() -> str:
+    executable_name = "ray.exe" if sys.platform == "win32" else "ray"
+    environment_cli = Path(sys.executable).with_name(executable_name)
+    if environment_cli.is_file():
+        return str(environment_cli)
     ray_cli = shutil.which("ray")
     if ray_cli is None:
         raise RuntimeError("Ray CLI not found; run `uv sync --extra distributed`.")
@@ -123,7 +127,7 @@ def _detect_lan_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
+            return cast(str, sock.getsockname()[0])
     except OSError:
         try:
             return socket.gethostbyname(socket.gethostname())
@@ -372,8 +376,7 @@ def _apply_ray_cluster_env() -> None:
 
 def _keep_ray_worker_alive(*, head: str, poll_sec: float, ray_env: dict[str, str]) -> None:
     typer.echo(
-        f"ray worker keep-alive active for {head}; "
-        "press Ctrl+C to stop this local Ray worker."
+        f"ray worker keep-alive active for {head}; press Ctrl+C to stop this local Ray worker."
     )
     try:
         while True:
@@ -408,7 +411,7 @@ def _keep_ray_worker_alive(*, head: str, poll_sec: float, ray_env: dict[str, str
         raise typer.Exit(code=0) from None
 
 
-def _ray_node_label(node: dict) -> str:
+def _ray_node_label(node: dict[str, Any]) -> str:
     address = node.get("NodeManagerAddress") or node.get("NodeManagerHostname") or "unknown"
     resources = node.get("Resources", {})
     cpu = resources.get("CPU", 0)
@@ -425,7 +428,7 @@ def _wait_for_ray_workers(
 ) -> None:
     _apply_ray_cluster_env()
     try:
-        import ray  # type: ignore[import-not-found]
+        import ray
     except ModuleNotFoundError as exc:
         typer.echo("Ray is not installed; run `uv sync --extra distributed`.", err=True)
         raise typer.Exit(code=1) from exc
@@ -442,7 +445,8 @@ def _wait_for_ray_workers(
     last_worker_count = -1
     deadline = monotonic() + timeout_sec
     while True:
-        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        ray_nodes = ray.nodes()  # type: ignore[no-untyped-call]
+        alive_nodes = [node for node in ray_nodes if node.get("Alive")]
         for node in alive_nodes:
             node_id = str(node.get("NodeID", _ray_node_label(node)))
             if node_id not in seen_node_ids:
@@ -466,15 +470,15 @@ def _wait_for_ray_workers(
 
 
 def _prompt_int(label: str) -> int | None:
-    typer.echo(f"{label}: ", nl=False)
-    line = sys.stdin.readline()
-    if line == "":
-        return None
-    try:
-        return int(line.strip())
-    except ValueError:
-        typer.echo("input non valido: inserire un numero intero", err=True)
-        return _prompt_int(label)
+    while True:
+        typer.echo(f"{label}: ", nl=False)
+        line = sys.stdin.readline()
+        if line == "":
+            return None
+        try:
+            return int(line.strip())
+        except ValueError:
+            typer.echo("input non valido: inserire un numero intero", err=True)
 
 
 @app.callback()
@@ -612,6 +616,8 @@ def resume(
                 f"gaz resume with execution backend {app_config.execution.backend}",
                 "resume execution",
             )
+    except typer.Exit:
+        raise
     except (KeyError, ValueError, RuntimeError, NotImplementedError, TimeoutError) as exc:
         typer.echo(f"Resume failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -798,7 +804,18 @@ def eval_command(config: ConfigOption, overrides: OverridesOption = None) -> Non
 
 @app.command()
 def play(
-    config: ConfigOption,
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Config file; optional when --run-dir contains config.resolved.yaml.",
+        ),
+    ] = None,
     overrides: OverridesOption = None,
     run_dir: Annotated[
         Path | None,
@@ -817,7 +834,7 @@ def play(
     ] = "best",
     human_player: Annotated[
         int,
-        typer.Option("--human-player", min=0, max=1, help="Human player index."),
+        typer.Option("--human-player", min=0, help="Human player index."),
     ] = 0,
     moves: Annotated[
         list[int] | None,
@@ -829,26 +846,51 @@ def play(
         _reject_checkpoint_shape_overrides(overrides)
         app_config = _validate_config(run_dir / "config.resolved.yaml", overrides)
     else:
+        if config is None:
+            typer.echo(
+                "Play failed: --config is required unless --run-dir contains config.resolved.yaml",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         app_config = _validate_config(config, overrides)
     from gumbel_az.envs import create_game
     from gumbel_az.play import play_scripted_game, result_message
-    from gumbel_az.play.session import AgentPlayer, apply_human_action, load_play_model
+    from gumbel_az.play.session import (
+        AgentPlayer,
+        apply_human_action,
+        load_play_model,
+        validate_human_player,
+    )
+
+    game = create_game(app_config.game.name)
+    try:
+        validate_human_player(game, human_player)
+    except ValueError as exc:
+        typer.echo(f"Play failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
     if moves is not None:
-        result = play_scripted_game(
-            app_config,
-            human_actions=moves,
-            run_dir=run_dir,
-            checkpoint=checkpoint,
-            human_player=human_player,
-        )
+        try:
+            result = play_scripted_game(
+                app_config,
+                human_actions=moves,
+                run_dir=run_dir,
+                checkpoint=checkpoint,
+                human_player=human_player,
+            )
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            typer.echo(f"Play failed: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
         typer.echo(result.board_text)
         typer.echo(result.message)
         raise typer.Exit(code=0)
 
-    game = create_game(app_config.game.name)
-    model = load_play_model(app_config, run_dir=run_dir, checkpoint=checkpoint)
-    agent = AgentPlayer(app_config, model=model)
+    try:
+        model = load_play_model(app_config, run_dir=run_dir, checkpoint=checkpoint)
+        agent = AgentPlayer(app_config, model=model)
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Play failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     state = game.init(app_config.run.seed)
     while not bool(game.is_terminal(state)):
         typer.echo(game.render_text(state))
@@ -1077,7 +1119,7 @@ def cluster_head(
         )
     )
     try:
-        import ray  # type: ignore[import-not-found]
+        import ray
     except ModuleNotFoundError as exc:
         typer.echo("Ray is not installed; run `uv sync --extra distributed`.", err=True)
         raise typer.Exit(code=1) from exc
@@ -1261,7 +1303,7 @@ def cluster_worker(
         )
     )
     try:
-        import ray  # type: ignore[import-not-found]
+        import ray
     except ModuleNotFoundError as exc:
         typer.echo("Ray is not installed; run `uv sync --extra distributed`.", err=True)
         raise typer.Exit(code=1) from exc
@@ -1334,7 +1376,7 @@ def cluster_status(
     """Print local Ray cluster status."""
     ray_env = _ray_cluster_env()
     try:
-        import ray  # type: ignore[import-not-found]
+        import ray
     except ModuleNotFoundError as exc:
         typer.echo("Ray is not installed; run `uv sync --extra distributed`.", err=True)
         raise typer.Exit(code=1) from exc

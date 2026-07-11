@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from gumbel_az.config.schema import AppConfig
 
@@ -37,7 +37,7 @@ class SchedulerDecision:
     shard_max_samples: int
     reason: str
 
-    def to_event(self) -> dict:
+    def to_event(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -56,8 +56,7 @@ class LocalScheduler:
             return SchedulerDecision(
                 mode="balanced",
                 allow_selfplay=False,
-                allow_training=signals.replay_samples_available
-                >= replay.min_samples_to_train,
+                allow_training=signals.replay_samples_available >= replay.min_samples_to_train,
                 max_selfplay_batches_in_flight=0,
                 replay_write_queue_limit=1,
                 evaluation_games_budget=0,

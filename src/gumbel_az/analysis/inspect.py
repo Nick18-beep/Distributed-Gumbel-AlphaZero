@@ -64,7 +64,11 @@ def inspect_replay(replay_dir: Path) -> dict[str, Any]:
         if not isinstance(entry, dict) or "path" not in entry:
             read_errors.append({"path": None, "error": "invalid shard index entry"})
             continue
-        shard_path = Path(entry["path"])
+        try:
+            shard_path = reader.resolve_shard_path(entry["path"])
+        except (TypeError, ValueError) as exc:
+            read_errors.append({"path": str(entry["path"]), "error": str(exc)})
+            continue
         if not shard_path.exists():
             missing_shards += 1
             continue

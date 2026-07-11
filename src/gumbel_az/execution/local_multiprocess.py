@@ -29,7 +29,7 @@ def _selfplay_process(
     run_dir: str,
     games: int,
     seed: int,
-    out,
+    out: Any,
 ) -> None:
     try:
         config = AppConfig.model_validate(config_data)

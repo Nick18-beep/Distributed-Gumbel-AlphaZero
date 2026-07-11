@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,7 +10,11 @@ import numpy as np
 import torch
 
 from gumbel_az.config.schema import SearchConfig
+from gumbel_az.domain.game import GameAdapter
+from gumbel_az.model.common import NetworkOutput
+from gumbel_az.search.backend import SearchBackend
 from gumbel_az.search.outputs import SearchOutput
+from gumbel_az.selfplay.trajectory import Trajectory
 
 
 def _unbatch_output(output: SearchOutput) -> SearchOutput:
@@ -26,8 +31,8 @@ def _unbatch_output(output: SearchOutput) -> SearchOutput:
 
 @dataclass(frozen=True)
 class GumbelAlphaZeroAlgorithm:
-    game: Any
-    search_backend: Any
+    game: GameAdapter
+    search_backend: SearchBackend
     search_config: SearchConfig
     temperature_moves: int
     name: str = "gumbel_alphazero"
@@ -36,7 +41,7 @@ class GumbelAlphaZeroAlgorithm:
         self,
         *,
         game_state: Any,
-        network_apply,
+        network_apply: Callable[[torch.Tensor], NetworkOutput],
         rng: torch.Generator,
         temperature: float = 0.0,
     ) -> SearchOutput:
@@ -69,8 +74,12 @@ class GumbelAlphaZeroAlgorithm:
     def temperature_for_move(self, move_index: int) -> float:
         return 1.0 if move_index < self.temperature_moves else 0.0
 
-    def generate_targets(self, trajectory, final_rewards: np.ndarray) -> list[dict]:
-        samples: list[dict] = []
+    def generate_targets(
+        self,
+        trajectory: Trajectory,
+        final_rewards: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
         for step in trajectory.steps:
             value_target = float(final_rewards[step.to_play])
             samples.append(

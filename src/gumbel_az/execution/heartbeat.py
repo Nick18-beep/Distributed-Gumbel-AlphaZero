@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 
 from gumbel_az.execution.messages import WorkerCapabilities, WorkerRecord, utc_now
 
@@ -66,5 +67,5 @@ class HeartbeatRegistry:
             raise KeyError(f"unknown worker {worker_id!r}")
         return self._workers[worker_id]
 
-    def snapshot(self) -> dict[str, dict]:
+    def snapshot(self) -> dict[str, dict[str, Any]]:
         return {worker_id: record.to_json() for worker_id, record in sorted(self._workers.items())}

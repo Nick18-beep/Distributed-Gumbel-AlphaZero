@@ -1,5 +1,7 @@
 """Execution backends."""
 
+from typing import Any
+
 from gumbel_az.execution.base import ExecutionBackend, ExecutionResult
 from gumbel_az.execution.single_process import SingleProcessExecutionBackend
 
@@ -12,7 +14,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     if name == "LocalMultiprocessExecutionBackend":
         from gumbel_az.execution.local_multiprocess import LocalMultiprocessExecutionBackend
 

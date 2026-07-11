@@ -21,12 +21,17 @@ def _state():
     network = create_network(config.model, num_actions=game.num_actions)
     model = network.init(0, game.observation_shape, game.num_actions)
     optimizer, _ = create_optimizer(model, config.training)
-    return game, model, optimizer, {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "step": 0,
-        "scaler_state_dict": None,
-    }
+    return (
+        game,
+        model,
+        optimizer,
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "step": 0,
+            "scaler_state_dict": None,
+        },
+    )
 
 
 def test_checkpoint_save_load_and_registry(tmp_path: Path) -> None:
@@ -56,6 +61,24 @@ def test_checkpoint_save_load_and_registry(tmp_path: Path) -> None:
     )
 
 
+def test_checkpoint_load_uses_restricted_weights_mode(tmp_path: Path, monkeypatch) -> None:
+    game, _model, _optimizer, state = _state()
+    manager = CheckpointManager(tmp_path / "checkpoints")
+    manager.save(version=1, state=state, metadata={"game": game.name}, best=True)
+    real_load = torch.load
+    calls: list[bool | None] = []
+
+    def recording_load(*args, **kwargs):
+        calls.append(kwargs.get("weights_only"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", recording_load)
+
+    manager.load()
+
+    assert calls == [True]
+
+
 def test_checkpoint_registry_uses_paths_stable_across_cwd(
     tmp_path: Path,
     monkeypatch,
@@ -75,6 +98,25 @@ def test_checkpoint_registry_uses_paths_stable_across_cwd(
     restored = CheckpointManager(root).load()
 
     assert int(restored["state"]["step"]) == 0
+
+
+def test_checkpoint_registry_is_portable_when_directory_moves(tmp_path: Path) -> None:
+    game, _model, _optimizer, state = _state()
+    source = tmp_path / "source" / "checkpoints"
+    manager = CheckpointManager(source)
+    manager.save(
+        version=4,
+        state=state,
+        metadata={"training_step": int(state["step"]), "game": game.name},
+    )
+    moved = tmp_path / "moved" / "checkpoints"
+    moved.parent.mkdir()
+    source.rename(moved)
+
+    pointer = json.loads((moved / "latest.json").read_text(encoding="utf-8"))
+
+    assert pointer["path"] == "ckpt_000004"
+    assert int(CheckpointManager(moved).load()["state"]["step"]) == 0
 
 
 def test_checkpoint_manager_resolves_relative_root(

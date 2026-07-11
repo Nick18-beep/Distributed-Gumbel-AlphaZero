@@ -41,13 +41,13 @@ def _has_four(board: np.ndarray, piece: int) -> bool:
 
 
 class ConnectFourGame:
-    name = "connect_four"
-    num_players = 2
-    num_actions = COLUMNS
-    observation_shape = (ROWS, COLUMNS, 2)
-    max_moves = ROWS * COLUMNS
-    supports_jit = False
-    supports_vmap = False
+    name: str = "connect_four"
+    num_players: int = 2
+    num_actions: int = COLUMNS
+    observation_shape: tuple[int, ...] = (ROWS, COLUMNS, 2)
+    max_moves: int = ROWS * COLUMNS
+    supports_jit: bool = False
+    supports_vmap: bool = False
 
     def init(self, rng_key: Any = None) -> ConnectFourState:
         del rng_key
@@ -60,7 +60,8 @@ class ConnectFourGame:
         )
 
     def legal_action_mask(self, state: ConnectFourState) -> np.ndarray:
-        return ((state.board[0, :] == EMPTY) & (not bool(state.terminated))).astype(bool)
+        legal = (state.board[0, :] == EMPTY) & (not bool(state.terminated))
+        return np.asarray(legal, dtype=np.bool_)
 
     def step(self, state: ConnectFourState, action: int) -> ConnectFourState:
         action = int(action)

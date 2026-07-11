@@ -93,15 +93,21 @@ class _RemoteMethod:
 
 
 class _FakeRemoteActor:
-    def __init__(self, result) -> None:
+    def __init__(self, result, remote_calls: list[dict]) -> None:
         self.result = result
-        self.generate_replay_shard = _RemoteMethod(lambda *args, **kwargs: result)
+
+        def generate(*args, **kwargs):
+            remote_calls.append({"args": args, "kwargs": kwargs})
+            return result
+
+        self.generate_replay_shard = _RemoteMethod(generate)
 
 
 class _FakeWorkerActorFactory:
     def __init__(self, results: list) -> None:
         self.results = results
         self.options_calls: list[dict] = []
+        self.remote_calls: list[dict] = []
         self.created = 0
 
     def options(self, **kwargs):
@@ -111,7 +117,7 @@ class _FakeWorkerActorFactory:
     def remote(self):
         result = self.results[self.created]
         self.created += 1
-        return _FakeRemoteActor(result)
+        return _FakeRemoteActor(result, self.remote_calls)
 
 
 def _capabilities(worker_id: str = "worker-1") -> WorkerCapabilities:
@@ -295,7 +301,7 @@ def test_worker_checkpoint_download_is_atomic_tree_copy(tmp_path: Path) -> None:
     assert Path(synced).name == "ckpt_000001"
     assert (Path(synced) / "payload").read_text(encoding="utf-8") == "ok"
     assert (tmp_path / "worker" / "checkpoints" / "latest.json").exists()
-    assert local_pointer["path"] == str(Path(synced).resolve())
+    assert local_pointer["path"] == Path(synced).name
 
 
 def test_worker_checkpoint_download_reuses_existing_immutable_checkpoint(tmp_path: Path) -> None:
@@ -317,6 +323,83 @@ def test_worker_checkpoint_download_reuses_existing_immutable_checkpoint(tmp_pat
 
     assert Path(synced) == destination
     assert (destination / "payload").read_text(encoding="utf-8") == "local"
+
+
+def test_checkpoint_payload_resolves_relative_registry_path(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    checkpoint_dir = checkpoint_root / "ckpt_000001"
+    checkpoint_dir.mkdir(parents=True)
+    expected = b"checkpoint-payload"
+    (checkpoint_dir / "checkpoint.pt").write_bytes(expected)
+    (checkpoint_root / "latest.json").write_text(
+        json.dumps({"version": 1, "path": "ckpt_000001"}),
+        encoding="utf-8",
+    )
+
+    payload = lan_ray_module._checkpoint_payload_bytes(tmp_path / "run")
+
+    assert payload == expected
+
+
+def test_checkpoint_payload_rejects_path_escape(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    checkpoint_root.mkdir(parents=True)
+    (checkpoint_root / "latest.json").write_text(
+        json.dumps({"version": 1, "path": "../../outside"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="escapes checkpoint root"):
+        lan_ray_module._checkpoint_payload_bytes(tmp_path / "run")
+
+
+def test_upload_component_removes_path_separators() -> None:
+    assert lan_ray_module._safe_upload_component("../../worker\\shard") == "shard"
+
+
+def test_worker_default_replay_slot_is_cleaned_after_transfer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lan_ray_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            "search.simulations_per_move=2",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+        ],
+    )
+    worker = WorkerActorCore(worker_id="cleanup-worker")
+
+    payload = worker.generate_replay_shard(
+        config.model_dump(mode="json"),
+        work_dir=None,
+        games=1,
+        seed=config.run.seed,
+        device="cpu",
+    )
+
+    assert payload["replay_shard_bytes"]
+    assert not (tmp_path / "gumbel_az_ray_workers").exists()
+
+
+def test_ready_futures_times_out_when_workers_do_not_finish() -> None:
+    class NeverReadyRay:
+        @staticmethod
+        def wait(futures, *, num_returns, timeout):
+            assert num_returns == 1
+            assert timeout is not None
+            return [], futures
+
+    with pytest.raises(TimeoutError, match="2 Ray self-play worker"):
+        list(
+            lan_ray_module._ready_futures(
+                NeverReadyRay(),
+                ["future-1", "future-2"],
+                timeout_sec=0.01,
+            )
+        )
 
 
 def test_ray_actor_factories_keep_ray_optional() -> None:
@@ -390,9 +473,7 @@ def test_lan_ray_backend_runs_training_after_cluster_init(
     result = LanRayExecutionBackend().run(config)
 
     assert result.status == "completed"
-    assert fake_ray.init_calls == [
-        {"address": "127.0.0.1:6399", "ignore_reinit_error": True}
-    ]
+    assert fake_ray.init_calls == [{"address": "127.0.0.1:6399", "ignore_reinit_error": True}]
     state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
     assert state["backend"] == "lan_ray"
     assert state["status"] == "completed"
@@ -460,6 +541,92 @@ def test_lan_ray_resume_preserves_state_and_continues_checkpoint(
     assert state["resumed_from_checkpoint"] is True
     assert latest["version"] == 2
     assert '"event": "checkpoint_loaded_for_resume"' in events
+
+
+def test_lan_ray_resume_counts_remote_game_and_loads_relative_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=1",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+    initial = SingleProcessExecutionBackend().run(initial_config)
+    fake_ray = _FakeRayWithRemoteWorkers(
+        [
+            {"Alive": True, "NodeID": "head-node", "NodeManagerAddress": "192.168.1.12"},
+            {
+                "Alive": True,
+                "NodeID": "remote-worker",
+                "NodeManagerAddress": "192.168.1.161",
+                "Resources": {"CPU": 1.0},
+            },
+        ]
+    )
+    worker_factory = _FakeWorkerActorFactory(
+        [
+            {
+                "worker_id": "remote-worker",
+                "worker_slot": 0,
+                "runtime_backend": "torch",
+                "device": "cpu",
+                "replay_shard": "/tmp/worker/shard_000000001.msgpack.zst",
+                "replay_shard_name": "shard_000000001.msgpack.zst",
+                "replay_shard_bytes": _encoded_sample_shard(),
+                "games": 1,
+                "positions": 1,
+                "games_per_sec": 1.0,
+                "positions_per_sec": 1.0,
+            }
+        ]
+    )
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    monkeypatch.setattr(lan_ray_module, "make_ray_worker_actor", lambda: worker_factory)
+    monkeypatch.setattr(
+        lan_ray_module,
+        "_ray_node_affinity_options",
+        lambda node_id: {"test_node_id": node_id},
+    )
+    resume_config = load_config(
+        initial.run_dir / "config.resolved.yaml",
+        [
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=1",
+            "stop.max_games=2",
+            "stop.max_iterations=1",
+            "stop.max_train_steps=2",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().resume(resume_config, initial.run_dir)
+
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    replay_index = json.loads(
+        (result.run_dir / "replay" / "index.json").read_text(encoding="utf-8")
+    )
+    events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    checkpoint_payload = worker_factory.remote_calls[0]["kwargs"]["checkpoint_payload_bytes"]
+    assert isinstance(checkpoint_payload, bytes)
+    assert state["games_seen"] == 2
+    assert state["remote_games"] == 1
+    assert len(replay_index["shards"]) == 2
+    assert events.count('"event": "selfplay_completed"') == 1
 
 
 def test_lan_ray_resume_does_not_schedule_remote_selfplay_without_game_budget(
@@ -594,8 +761,18 @@ def test_lan_ray_backend_continues_when_one_remote_worker_fails(
     assert state["remote_replay_samples_imported"] == 1
     assert replay_index["total_samples"] >= 1
     assert worker_factory.options_calls == [
-        {"test_node_id": "mac-worker", "num_cpus": 1},
-        {"test_node_id": "win-worker", "num_cpus": 1},
+        {
+            "test_node_id": "mac-worker",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
+        {
+            "test_node_id": "win-worker",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
     ]
 
 
@@ -740,11 +917,108 @@ def test_lan_ray_backend_uses_remote_node_cpu_slots(
     assert state["remote_replay_samples_imported"] == 4
     assert '"event": "lan_ray_remote_selfplay_scheduled"' in events
     assert worker_factory.options_calls == [
-        {"test_node_id": "mac-worker", "num_cpus": 1},
-        {"test_node_id": "mac-worker", "num_cpus": 1},
-        {"test_node_id": "mac-worker", "num_cpus": 1},
-        {"test_node_id": "mac-worker", "num_cpus": 1},
+        {
+            "test_node_id": "mac-worker",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
+        {
+            "test_node_id": "mac-worker",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
+        {
+            "test_node_id": "mac-worker",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
+        {
+            "test_node_id": "mac-worker",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
     ]
+
+
+def test_lan_ray_backend_schedules_three_distinct_remote_nodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_ids = ["pc-1", "pc-2", "pc-3"]
+    fake_ray = _FakeRayWithRemoteWorkers(
+        [
+            {"Alive": True, "NodeID": "head-node", "NodeManagerAddress": "192.168.1.10"},
+            *[
+                {
+                    "Alive": True,
+                    "NodeID": node_id,
+                    "NodeManagerAddress": f"192.168.1.{20 + index}",
+                    "Resources": {"CPU": 1.0},
+                }
+                for index, node_id in enumerate(remote_ids)
+            ],
+        ]
+    )
+    worker_factory = _FakeWorkerActorFactory(
+        [
+            {
+                "worker_id": node_id,
+                "worker_slot": index,
+                "runtime_backend": "torch",
+                "device": "cpu",
+                "replay_shard": f"/worker/{node_id}/shard.msgpack.zst",
+                "replay_shard_name": "shard.msgpack.zst",
+                "replay_shard_bytes": _encoded_sample_shard(),
+                "games": 1,
+                "positions": 1,
+                "games_per_sec": 1.0,
+                "positions_per_sec": 1.0,
+            }
+            for index, node_id in enumerate(remote_ids)
+        ]
+    )
+    monkeypatch.setattr(lan_ray_module, "_require_ray", lambda: fake_ray)
+    monkeypatch.setattr(lan_ray_module, "make_ray_worker_actor", lambda: worker_factory)
+    monkeypatch.setattr(
+        lan_ray_module,
+        "_ray_node_affinity_options",
+        lambda node_id: {"test_node_id": node_id},
+    )
+    config = load_config(
+        DEBUG_CONFIG,
+        [
+            f"run.output_dir={tmp_path.as_posix()}",
+            "execution.backend=lan_ray",
+            "cluster.enabled=true",
+            "cluster.head_address=127.0.0.1:6399",
+            "selfplay.games_per_iteration=3",
+            "stop.max_games=3",
+            "stop.max_iterations=1",
+            "search.simulations_per_move=2",
+            "replay.min_samples_to_train=1",
+            "replay.low_watermark=1",
+            "training.batch_size=4",
+            "training.steps_per_iteration=1",
+            "training.checkpoint_every_steps=1",
+            "stop.max_train_steps=1",
+            "eval.games=2",
+        ],
+    )
+
+    result = LanRayExecutionBackend().run(config)
+
+    state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert state["remote_workers_available"] == 3
+    assert state["remote_workers_scheduled"] == 3
+    assert state["remote_workers_completed"] == 3
+    assert state["remote_games"] == 3
+    assert state["games_seen"] == 3
+    assert not (result.run_dir / "ray_uploads").exists()
+    assert [call["test_node_id"] for call in worker_factory.options_calls] == remote_ids
 
 
 def test_lan_ray_backend_uses_head_cpu_slots_after_remote_workers(
@@ -822,7 +1096,22 @@ def test_lan_ray_backend_uses_head_cpu_slots_after_remote_workers(
     assert state["remote_games"] == 3
     assert state["games_seen"] == 3
     assert worker_factory.options_calls == [
-        {"test_node_id": "mac-worker", "num_cpus": 1},
-        {"test_node_id": "head-node", "num_cpus": 1},
-        {"test_node_id": "head-node", "num_cpus": 1},
+        {
+            "test_node_id": "mac-worker",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
+        {
+            "test_node_id": "head-node",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
+        {
+            "test_node_id": "head-node",
+            "num_cpus": 1,
+            "max_restarts": 1,
+            "max_task_retries": 1,
+        },
     ]

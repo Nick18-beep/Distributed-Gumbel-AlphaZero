@@ -146,6 +146,10 @@ def test_benchmark_smoke_writes_jsonl(tmp_path: Path) -> None:
     selfplay_record = next(record for record in records if record["benchmark"] == "selfplay")
     assert selfplay_record["warmup_games"] == 1
     assert selfplay_record["measured_games"] == 1
+    metadata = next(record for record in records if record["benchmark"] == "metadata")
+    assert metadata["workspace_temporary"] is True
+    assert not list((tmp_path / "benchmarks").glob(".gaz-benchmark-*"))
+    assert not list(tmp_path.glob("*_connect-four-cpu-debug"))
 
 
 def test_cli_benchmark_smoke(tmp_path: Path, monkeypatch) -> None:

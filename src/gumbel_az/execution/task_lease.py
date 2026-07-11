@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 from gumbel_az.execution.messages import LeaseRecord, utc_now
@@ -21,7 +22,13 @@ class TaskLeaseManager:
         self.max_attempts = max_attempts
         self._tasks: dict[str, LeaseRecord] = {}
 
-    def submit(self, task_type: str, payload: dict, *, task_id: str | None = None) -> LeaseRecord:
+    def submit(
+        self,
+        task_type: str,
+        payload: dict[str, Any],
+        *,
+        task_id: str | None = None,
+    ) -> LeaseRecord:
         task_id = task_id or uuid4().hex
         if task_id in self._tasks:
             raise ValueError(f"task already exists: {task_id}")
@@ -101,7 +108,7 @@ class TaskLeaseManager:
     def pending_or_leased(self) -> Iterable[LeaseRecord]:
         return (record for record in self._tasks.values() if record.status in {"pending", "leased"})
 
-    def snapshot(self) -> dict[str, dict]:
+    def snapshot(self) -> dict[str, dict[str, Any]]:
         return {task_id: record.to_json() for task_id, record in sorted(self._tasks.items())}
 
     def _require_leased(

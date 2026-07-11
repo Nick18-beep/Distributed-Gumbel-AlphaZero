@@ -14,7 +14,7 @@ authors = [
 ]
 dependencies = [
   "msgpack",
-  "numpy",
+  "numpy<2.5",
   "pydantic",
   "pyyaml",
   "typer",
@@ -33,6 +33,7 @@ dev = [
   "pytest",
   "pytest-cov",
   "ruff",
+  "types-PyYAML",
 ]
 distributed = [
   "ray[default]",
@@ -87,3 +88,7 @@ testpaths = ["tests"]
 python_version = "3.11"
 packages = ["gumbel_az"]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["msgpack", "ray.*"]
+ignore_missing_imports = true

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 
 from gumbel_az.config.schema import SearchConfig
+from gumbel_az.model.common import NetworkOutput
 from gumbel_az.search.masking import apply_legal_mask
 from gumbel_az.search.outputs import SearchOutput
 from gumbel_az.search.q_transform import completed_by_mix_value
@@ -38,14 +40,14 @@ class TorchGumbelSearchBackend:
     name = "torch_gumbel"
 
     def __init__(self, game: Any | None = None, device: torch.device | str | None = None) -> None:
-        self.game = game
+        self.game: Any = game
         self.device = torch.device(device or "cpu")
 
     def _child_values(
         self,
         *,
         root_embedding: Any | None,
-        network_apply,
+        network_apply: Callable[[torch.Tensor], NetworkOutput],
         batch_size: int,
         num_actions: int,
     ) -> torch.Tensor:
@@ -91,14 +93,14 @@ class TorchGumbelSearchBackend:
         with torch.inference_mode():
             output = network_apply(obs)
             values = output.value.detach()
-        for index, (batch_index, action, _player) in enumerate(child_refs):
-            q_values[batch_index, action] = -values[index]
+        for index, (batch_index, child_action, _player) in enumerate(child_refs):
+            q_values[batch_index, child_action] = -values[index]
         return q_values
 
     def _evaluate_state(
         self,
         state: Any,
-        network_apply,
+        network_apply: Callable[[torch.Tensor], NetworkOutput],
         *,
         legal_override: np.ndarray | None = None,
     ) -> tuple[np.ndarray, float]:
@@ -110,7 +112,7 @@ class TorchGumbelSearchBackend:
         legal = (
             np.asarray(legal_override, dtype=bool)
             if legal_override is not None
-            else np.asarray(self.game.legal_action_mask(state), dtype=bool)
+            else np.asarray(self.game.legal_action_mask(state)).astype(bool)
         )
         with torch.inference_mode():
             output = network_apply(observation)
@@ -130,14 +132,14 @@ class TorchGumbelSearchBackend:
     def _make_node(
         self,
         state: Any,
-        network_apply,
+        network_apply: Callable[[torch.Tensor], NetworkOutput],
         *,
         legal_override: np.ndarray | None = None,
     ) -> _MctsNode:
         legal = (
             np.asarray(legal_override, dtype=bool)
             if legal_override is not None
-            else np.asarray(self.game.legal_action_mask(state), dtype=bool)
+            else np.asarray(self.game.legal_action_mask(state)).astype(bool)
         )
         prior, value = self._evaluate_state(state, network_apply, legal_override=legal)
         return _MctsNode(
@@ -188,7 +190,7 @@ class TorchGumbelSearchBackend:
     def _simulate(
         self,
         node: _MctsNode,
-        network_apply,
+        network_apply: Callable[[torch.Tensor], NetworkOutput],
         *,
         root_scores: np.ndarray | None = None,
         candidate_mask: np.ndarray | None = None,
@@ -227,7 +229,7 @@ class TorchGumbelSearchBackend:
         root_state: Any,
         prior_logits: torch.Tensor,
         legal_mask: torch.Tensor,
-        network_apply,
+        network_apply: Callable[[torch.Tensor], NetworkOutput],
         rng: torch.Generator,
         config: SearchConfig,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -287,7 +289,7 @@ class TorchGumbelSearchBackend:
         *,
         root_observation: torch.Tensor,
         root_legal_mask: torch.Tensor,
-        network_apply,
+        network_apply: Callable[[torch.Tensor], NetworkOutput],
         rng: torch.Generator,
         config: SearchConfig,
         root_embedding: Any | None = None,

@@ -436,6 +436,23 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
     assert calls[0]["env"]["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
 
 
+def test_ray_cli_prefers_current_virtual_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scripts = tmp_path / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    python = scripts / "python.exe"
+    ray = scripts / "ray.exe"
+    python.touch()
+    ray.touch()
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    monkeypatch.setattr(cli_main.sys, "executable", str(python))
+    monkeypatch.setattr(cli_main.shutil, "which", lambda _name: "C:/global/ray.exe")
+
+    assert cli_main._ray_cli_path() == str(ray)
+
+
 def test_cluster_worker_passes_fixed_ray_ports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -700,10 +717,7 @@ def test_cluster_head_wait_workers_uses_resolved_lan_address(
 
     assert result.exit_code == 0
     assert "ray head address for workers: 192.168.1.12:6379" in result.output
-    assert (
-        "worker command: gaz cluster worker --head 192.168.1.12:6379"
-        in result.output
-    )
+    assert "worker command: gaz cluster worker --head 192.168.1.12:6379" in result.output
     assert "--node-ip WORKER_LAN_IP" in result.output
     assert "configs/connect_four_lan.yaml" in result.output
     assert "configs\\connect_four_lan.yaml" not in result.output
@@ -789,7 +803,7 @@ def test_cluster_stop_runs_ray_stop_and_orphan_cleanup(
     assert "ray stopped; cleaned orphan process(es): 2" in result.output
 
 
-def test_config_command_accepts_override() -> None:
+def test_config_command_accepts_override(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
         [
@@ -798,6 +812,8 @@ def test_config_command_accepts_override() -> None:
             str(DEBUG_CONFIG),
             "--set",
             "run.seed=123",
+            "--set",
+            f"run.output_dir={tmp_path.as_posix()}",
             "--set",
             "selfplay.games_per_iteration=1",
             "--set",
@@ -922,6 +938,32 @@ def test_resume_status_only_reports_state(tmp_path: Path, monkeypatch: pytest.Mo
     assert result.exit_code == 0
     assert "resume state:" in result.output
     assert "train_step=2" in result.output
+
+
+def test_resume_local_multiprocess_has_single_clear_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    run_dir = Path("run")
+    run_dir.mkdir()
+    (run_dir / "config.resolved.yaml").write_text(
+        DEBUG_CONFIG.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (run_dir / "run_state.json").write_text(
+        '{"status": "completed", "train_step": 2, "games_seen": 1}',
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["resume", str(run_dir), "--execution", "local_multiprocess"],
+    )
+
+    assert result.exit_code == 1
+    assert "local_multiprocess resume is not implemented" in result.output
+    assert "Resume failed:" not in result.output
 
 
 def test_inspect_run_reports_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

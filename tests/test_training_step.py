@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 import gumbel_az.training.trainer as trainer_module
@@ -11,6 +12,7 @@ from gumbel_az.model.checkpoint import CheckpointManager
 from gumbel_az.model.optimizer import WarmupCosineSchedule, create_optimizer
 from gumbel_az.replay import ReplayReader, ReplayWriter
 from gumbel_az.training import TorchTrainState, train_step
+from gumbel_az.training.train_state import _validate_grad_norm
 from gumbel_az.training.trainer import (
     Trainer,
     _checkpoint_model_state_dict,
@@ -66,11 +68,18 @@ def test_train_step_is_finite_and_updates_params() -> None:
     assert torch.isfinite(torch.tensor(metrics["value_loss"]))
     assert torch.isfinite(torch.tensor(metrics["grad_norm"]))
     assert metrics["grad_norm"] > 0.0
+    assert metrics["amp_overflow"] == 0.0
     assert any(
         not torch.equal(before[key], value)
         for key, value in model.state_dict().items()
         if value.dtype.is_floating_point
     )
+
+
+def test_non_finite_grad_norm_is_only_tolerated_for_managed_amp_overflow() -> None:
+    assert _validate_grad_norm(float("nan"), amp_overflow_is_managed=True) == (0.0, True)
+    with pytest.raises(FloatingPointError, match="non-finite gradient norm"):
+        _validate_grad_norm(float("inf"), amp_overflow_is_managed=False)
 
 
 def test_warmup_cosine_schedule_uses_global_total_steps() -> None:
@@ -103,6 +112,36 @@ def test_compile_auto_keeps_cpu_debug_eager() -> None:
 
     assert compiled is model
     assert mode == "eager"
+
+
+def test_compile_auto_keeps_cuda_eager_without_triton(monkeypatch) -> None:
+    model = torch.nn.Linear(2, 2)
+    monkeypatch.setattr(trainer_module.importlib.util, "find_spec", lambda name: None)
+
+    compiled, mode = _maybe_compile_model(
+        model,
+        compile_policy="auto",
+        device=torch.device("cuda"),
+        run_name="connect-four-gpu",
+    )
+
+    assert compiled is model
+    assert mode == "eager"
+
+
+def test_compile_on_reports_fallback_for_cuda_without_triton(monkeypatch) -> None:
+    model = torch.nn.Linear(2, 2)
+    monkeypatch.setattr(trainer_module.importlib.util, "find_spec", lambda name: None)
+
+    compiled, mode = _maybe_compile_model(
+        model,
+        compile_policy="on",
+        device=torch.device("cuda"),
+        run_name="connect-four-gpu",
+    )
+
+    assert compiled is model
+    assert mode == "fallback"
 
 
 def test_compile_on_reports_fallback_when_compile_fails(monkeypatch) -> None:
