@@ -175,6 +175,14 @@ class LocalMultiprocessExecutionBackend:
                 "root_value_mean": message["root_value_mean"],
             },
         )
+        state.update(
+            {
+                "games_seen": int(message["games"]),
+                "samples_seen": int(message["positions"]),
+                "replay_shard": message["replay_shard"],
+            }
+        )
+        atomic_write_json(paths.run_state_path, state)
         try:
             result = RunOrchestrator(
                 config,
@@ -182,6 +190,7 @@ class LocalMultiprocessExecutionBackend:
                 runtime_backend=runtime,
                 event_writer=event_writer,
                 metric_writer=metric_writer,
+                skip_initial_selfplay_if_replay_available=True,
             ).run()
         except Exception as exc:
             latest_state = state

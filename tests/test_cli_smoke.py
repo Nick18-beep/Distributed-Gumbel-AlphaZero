@@ -283,6 +283,7 @@ def test_ray_cluster_env_enables_experimental_non_linux_multinode(
 ) -> None:
     monkeypatch.delenv("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", raising=False)
     monkeypatch.delenv("RAY_raylet_start_wait_time_s", raising=False)
+    monkeypatch.delenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", raising=False)
     monkeypatch.delenv("RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL", raising=False)
     monkeypatch.setattr(cli_main.sys, "platform", "darwin")
 
@@ -290,6 +291,7 @@ def test_ray_cluster_env_enables_experimental_non_linux_multinode(
 
     assert env["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
     assert env["RAY_raylet_start_wait_time_s"] == "60"
+    assert env["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] == "0"
     assert env["RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL"] == "minor"
 
 

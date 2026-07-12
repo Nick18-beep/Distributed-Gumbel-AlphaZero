@@ -33,6 +33,7 @@ class RunOrchestrator:
         metric_writer: MetricWriter,
         skip_initial_selfplay_if_replay_available: bool = False,
         resume: bool = False,
+        started_at: float | None = None,
     ) -> None:
         self.config = config
         self.paths = paths
@@ -41,6 +42,7 @@ class RunOrchestrator:
         self.metric_writer = metric_writer
         self.skip_initial_selfplay_if_replay_available = skip_initial_selfplay_if_replay_available
         self.resume = resume
+        self.started_at = started_at
 
     def _write_state(self, **updates: Any) -> dict[str, Any]:
         previous: dict[str, Any] = {}
@@ -108,7 +110,7 @@ class RunOrchestrator:
         return result
 
     def run(self) -> ExecutionResult:
-        started = perf_counter()
+        started = self.started_at if self.started_at is not None else perf_counter()
         previous_state: dict[str, Any] = {}
         if self.paths.run_state_path.exists():
             try:
@@ -122,8 +124,8 @@ class RunOrchestrator:
             config_path=str(self.paths.resolved_config_path),
             resumed_from_checkpoint=bool(self.resume),
             train_step=int(previous_state.get("train_step", 0)) if self.resume else 0,
-            games_seen=int(previous_state.get("games_seen", 0)) if self.resume else 0,
-            samples_seen=int(previous_state.get("samples_seen", 0)) if self.resume else 0,
+            games_seen=int(previous_state.get("games_seen", 0)),
+            samples_seen=int(previous_state.get("samples_seen", 0)),
             iterations_completed=int(previous_state.get("iterations_completed", 0))
             if self.resume
             else 0,
@@ -191,12 +193,12 @@ class RunOrchestrator:
             )
             selfplay_worker.model_version = int(trainer.state.step)
 
-            total_games = (int(previous_state.get("games_seen", 0)) if self.resume else 0) + int(
+            total_games = int(previous_state.get("games_seen", 0)) + int(
                 previous_state.get("remote_games", 0)
             )
-            total_positions = (
-                int(previous_state.get("samples_seen", 0)) if self.resume else 0
-            ) + int(previous_state.get("remote_positions", 0))
+            total_positions = int(previous_state.get("samples_seen", 0)) + int(
+                previous_state.get("remote_positions", 0)
+            )
             iterations_completed = (
                 int(previous_state.get("iterations_completed", 0)) if self.resume else 0
             )

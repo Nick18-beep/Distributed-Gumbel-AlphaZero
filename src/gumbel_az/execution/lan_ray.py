@@ -32,6 +32,11 @@ from gumbel_az.storage.atomic import atomic_write_json
 from gumbel_az.storage.filesystem import RunPaths, existing_run_paths
 from gumbel_az.storage.transfer import CheckpointSync, ReplayTransfer
 
+_GIB = 1024**3
+_SELFPLAY_ACTOR_MEMORY_BYTES = 2 * _GIB
+_HEAD_MEMORY_RESERVE_BYTES = 4 * _GIB
+_WORKER_MEMORY_RESERVE_BYTES = 2 * _GIB
+
 
 def _lan_progress_message(record: dict[str, Any]) -> str | None:
     event = record.get("event")
@@ -48,6 +53,8 @@ def _lan_progress_message(record: dict[str, Any]) -> str | None:
             "[lan_ray] scheduled remote self-play: "
             f"node={record.get('ray_node_address')} "
             f"actors={record.get('actors')} "
+            f"cpus_per_actor={record.get('cpus_per_actor')} "
+            f"memory_gib={record.get('memory_gib')} "
             f"games={record.get('games')}"
         )
     if event == "lan_ray_remote_selfplay_completed":
@@ -128,6 +135,7 @@ def _require_ray() -> Any:
 
 
 def _enable_ray_experimental_multinode_if_needed() -> None:
+    os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
     if sys.platform in {"win32", "darwin"}:
         os.environ.setdefault("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", "1")
 
@@ -153,6 +161,15 @@ class HeadSnapshot:
     workers: dict[str, dict[str, Any]]
     tasks: dict[str, dict[str, Any]]
     commands: dict[str, list[str]]
+
+
+@dataclass(frozen=True)
+class RaySelfPlayNodePlan:
+    actor_count: int
+    cpus_per_actor: int
+    cpu_count: int
+    memory_bytes: int | None
+    actor_limit: int
 
 
 class HeadController:
@@ -306,7 +323,10 @@ class WorkerActorCore:
         import torch
 
         selected_device = torch.device(device or runtime.device)
-        torch_threads = max(1, int(os.environ.get("GAZ_RAY_ACTOR_TORCH_THREADS", "1")))
+        torch_threads = max(
+            1,
+            int(os.environ.get("GAZ_RAY_ACTOR_TORCH_THREADS", "1")),
+        )
         torch.set_num_threads(torch_threads)
         print(
             "[gaz-worker] self-play starting "
@@ -458,8 +478,82 @@ def _ray_node_cpu_count(node: dict[str, Any]) -> int:
         return 1
     try:
         return max(1, int(float(resources.get("CPU", 1))))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return 1
+
+
+def _ray_node_memory_bytes(node: dict[str, Any]) -> int | None:
+    resources = node.get("Resources", {})
+    if not isinstance(resources, dict):
+        return None
+    try:
+        value = int(float(resources["memory"]))
+    except (KeyError, OverflowError, TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _ray_selfplay_node_plan(
+    config: AppConfig,
+    node: dict[str, Any],
+    *,
+    is_head: bool,
+    remaining_actor_budget: int,
+) -> RaySelfPlayNodePlan:
+    node_cpu_count = _ray_node_cpu_count(node)
+    cpu_reserve = 2 if is_head else 1
+    usable_cpus = max(1, node_cpu_count - cpu_reserve)
+    configured = (
+        config.cluster.head_selfplay_actors
+        if is_head
+        else config.cluster.max_selfplay_actors_per_node
+    )
+    memory_bytes = _ray_node_memory_bytes(node)
+    if configured == "auto":
+        if memory_bytes is None:
+            memory_actor_limit = 1 if is_head else min(2, usable_cpus)
+        else:
+            memory_reserve = _HEAD_MEMORY_RESERVE_BYTES if is_head else _WORKER_MEMORY_RESERVE_BYTES
+            memory_actor_limit = max(
+                1,
+                (memory_bytes - memory_reserve) // _SELFPLAY_ACTOR_MEMORY_BYTES,
+            )
+        actor_limit = min(usable_cpus, memory_actor_limit)
+    else:
+        actor_limit = min(usable_cpus, int(configured))
+    actor_count = min(actor_limit, remaining_actor_budget)
+    cpus_per_actor = max(1, usable_cpus // max(1, actor_count))
+    return RaySelfPlayNodePlan(
+        actor_count=actor_count,
+        cpus_per_actor=cpus_per_actor,
+        cpu_count=node_cpu_count,
+        memory_bytes=memory_bytes,
+        actor_limit=actor_limit,
+    )
+
+
+def _allocate_games_by_weight(total_games: int, weights: list[int]) -> list[int]:
+    if not weights or any(weight <= 0 for weight in weights):
+        raise ValueError("game allocation requires positive actor weights")
+    if total_games < len(weights):
+        raise ValueError("game allocation requires at least one game per actor")
+    allocations = [1] * len(weights)
+    remaining = total_games - len(weights)
+    if remaining == 0:
+        return allocations
+    total_weight = sum(weights)
+    weighted = [remaining * weight for weight in weights]
+    for index, value in enumerate(weighted):
+        allocations[index] += value // total_weight
+    leftover = total_games - sum(allocations)
+    remainder_order = sorted(
+        range(len(weights)),
+        key=lambda index: weighted[index] % total_weight,
+        reverse=True,
+    )
+    for index in remainder_order[:leftover]:
+        allocations[index] += 1
+    return allocations
 
 
 def _checkpoint_payload_bytes(run_dir: Path) -> bytes | None:
@@ -485,6 +579,16 @@ def _checkpoint_payload_bytes(run_dir: Path) -> bytes | None:
 def _put_shared_argument(ray: Any, value: Any, *, shared: bool) -> Any:
     put = getattr(ray, "put", None)
     return put(value) if shared and callable(put) else value
+
+
+def _worker_config_payload(config: AppConfig) -> dict[str, Any]:
+    """Return worker-compatible config without head-only scheduling fields."""
+    payload = config.model_dump(mode="json")
+    cluster = payload.get("cluster")
+    if isinstance(cluster, dict):
+        cluster.pop("max_selfplay_actors_per_node", None)
+        cluster.pop("head_selfplay_actors", None)
+    return payload
 
 
 def _ready_futures(
@@ -563,6 +667,7 @@ class LanRayExecutionBackend:
         *,
         resume: bool,
     ) -> ExecutionResult:
+        lifecycle_started = perf_counter()
         _enable_ray_experimental_multinode_if_needed()
         ray = _require_ray()
         event_writer = ConsoleEventWriter(paths.events_path)
@@ -602,7 +707,10 @@ class LanRayExecutionBackend:
             }
         )
         remote_nodes = _remote_ray_nodes(ray)
-        actor_nodes = _selfplay_ray_nodes(ray, include_head=bool(remote_nodes))
+        actor_nodes = _selfplay_ray_nodes(
+            ray,
+            include_head=bool(remote_nodes) and config.cluster.head_selfplay_actors != 0,
+        )
         remote_stats = {
             "remote_workers_available": len(remote_nodes),
             "remote_workers_scheduled": 0,
@@ -623,37 +731,62 @@ class LanRayExecutionBackend:
             games = min(remaining_game_budget, config.selfplay.games_per_iteration)
         if actor_nodes and games > 0:
             worker_actor = make_ray_worker_actor()
-            node_actor_counts: list[tuple[dict[str, Any], bool, int]] = []
+            node_actor_counts: list[tuple[dict[str, Any], bool, RaySelfPlayNodePlan]] = []
             remaining_actor_budget = games
             for node, is_head in actor_nodes:
                 if remaining_actor_budget <= 0:
                     break
-                node_cpu_count = _ray_node_cpu_count(node)
-                usable_cpus = max(1, node_cpu_count - 2) if is_head else node_cpu_count
-                actor_count = min(usable_cpus, remaining_actor_budget)
-                node_actor_counts.append((node, is_head, actor_count))
-                remaining_actor_budget -= actor_count
-            actor_plan: list[tuple[dict[str, Any], bool, int, int]] = []
+                node_plan = _ray_selfplay_node_plan(
+                    config,
+                    node,
+                    is_head=is_head,
+                    remaining_actor_budget=remaining_actor_budget,
+                )
+                node_actor_counts.append((node, is_head, node_plan))
+                remaining_actor_budget -= node_plan.actor_count
+            actor_slots: list[tuple[dict[str, Any], bool, int, int]] = []
             slot = 0
-            total_actors = sum(actor_count for _, _, actor_count in node_actor_counts)
-            base_games_per_actor = games // total_actors
-            extra_games = games % total_actors
-            for node, is_head, actor_count in node_actor_counts:
-                node_games = 0
-                for _ in range(actor_count):
-                    actor_games = base_games_per_actor + (1 if slot < extra_games else 0)
-                    actor_plan.append((node, is_head, slot, actor_games))
-                    node_games += actor_games
+            total_actors = sum(plan.actor_count for _, _, plan in node_actor_counts)
+            for node, is_head, node_plan in node_actor_counts:
+                for _ in range(node_plan.actor_count):
+                    actor_slots.append((node, is_head, slot, node_plan.cpus_per_actor))
                     slot += 1
+            if total_actors != len(actor_slots):
+                raise RuntimeError("Ray actor plan size mismatch")
+            game_allocations = _allocate_games_by_weight(
+                games,
+                [cpus_per_actor for _, _, _, cpus_per_actor in actor_slots],
+            )
+            actor_plan = [
+                (node, is_head, worker_slot, actor_games, cpus_per_actor)
+                for (node, is_head, worker_slot, cpus_per_actor), actor_games in zip(
+                    actor_slots,
+                    game_allocations,
+                    strict=True,
+                )
+            ]
+            actor_offset = 0
+            for node, is_head, node_plan in node_actor_counts:
+                node_games = sum(
+                    game_allocations[actor_offset : actor_offset + node_plan.actor_count]
+                )
+                actor_offset += node_plan.actor_count
                 event_writer.write(
                     {
                         "event": "lan_ray_remote_selfplay_scheduled",
                         "ray_node_id": str(node.get("NodeID", "")),
                         "ray_node_address": _ray_node_address(node),
                         "is_head_node": is_head,
-                        "actors": actor_count,
+                        "actors": node_plan.actor_count,
+                        "actor_limit": node_plan.actor_limit,
+                        "cpus_per_actor": node_plan.cpus_per_actor,
                         "games": node_games,
-                        "cpu_count": _ray_node_cpu_count(node),
+                        "cpu_count": node_plan.cpu_count,
+                        "memory_gib": (
+                            None
+                            if node_plan.memory_bytes is None
+                            else round(node_plan.memory_bytes / _GIB, 2)
+                        ),
                     }
                 )
             remote_stats["remote_workers_scheduled"] = len(actor_plan)
@@ -664,12 +797,17 @@ class LanRayExecutionBackend:
                 )
             actors = []
             try:
-                for node, _, _, _ in actor_plan:
+                for node, _, _, _, cpus_per_actor in actor_plan:
                     node_id = str(node.get("NodeID", ""))
                     actors.append(
                         worker_actor.options(
                             **_ray_node_affinity_options(node_id),
-                            num_cpus=1,
+                            num_cpus=cpus_per_actor,
+                            runtime_env={
+                                "env_vars": {
+                                    "GAZ_RAY_ACTOR_TORCH_THREADS": str(cpus_per_actor),
+                                }
+                            },
                             max_restarts=1,
                             max_task_retries=1,
                         ).remote()
@@ -680,7 +818,7 @@ class LanRayExecutionBackend:
             shared = len(actors) > 1
             config_payload = _put_shared_argument(
                 ray,
-                config.model_dump(mode="json"),
+                _worker_config_payload(config),
                 shared=shared,
             )
             checkpoint_argument = _put_shared_argument(
@@ -698,9 +836,10 @@ class LanRayExecutionBackend:
                     device="cpu" if is_head else None,
                     checkpoint_payload_bytes=checkpoint_argument,
                 )
-                for index, (actor, (_, is_head, worker_slot, actor_games)) in enumerate(
-                    zip(actors, actor_plan, strict=True)
-                )
+                for index, (
+                    actor,
+                    (_, is_head, worker_slot, actor_games, cpus_per_actor),
+                ) in enumerate(zip(actors, actor_plan, strict=True))
                 if actor_games > 0
             ]
             head = HeadController(run_dir=paths.run_dir, event_writer=event_writer)
@@ -710,7 +849,14 @@ class LanRayExecutionBackend:
                 for index, future in _ready_futures(
                     ray,
                     futures,
-                    timeout_sec=config.stop.max_wall_time_sec,
+                    timeout_sec=(
+                        None
+                        if config.stop.max_wall_time_sec is None
+                        else max(
+                            0.0,
+                            config.stop.max_wall_time_sec - (perf_counter() - lifecycle_started),
+                        )
+                    ),
                 ):
                     node = actor_plan[index][0]
                     try:
@@ -788,6 +934,7 @@ class LanRayExecutionBackend:
             metric_writer=metric_writer,
             skip_initial_selfplay_if_replay_available=False,
             resume=resume,
+            started_at=lifecycle_started,
         ).run()
         if paths.run_state_path.exists():
             final_state = json.loads(paths.run_state_path.read_text(encoding="utf-8"))

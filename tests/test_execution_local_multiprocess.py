@@ -31,14 +31,20 @@ def test_local_multiprocess_backend_smoke(tmp_path: Path) -> None:
 
     state = json.loads((result.run_dir / "run_state.json").read_text(encoding="utf-8"))
     events = (result.run_dir / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    replay_index = json.loads(
+        (result.run_dir / "replay" / "index.json").read_text(encoding="utf-8")
+    )
     assert result.status == "completed"
     assert state["backend"] == "local_multiprocess"
     assert state["worker_processes_started"] == 1
     assert state["games_seen"] == 1
+    assert state["samples_seen"] == replay_index["total_samples"]
     assert state["train_step"] == 1
+    assert len(replay_index["shards"]) == 1
     assert (result.run_dir / "replay" / "index.json").exists()
     assert (result.run_dir / "checkpoints" / "latest.json").exists()
     assert "worker_process_completed" in events
+    assert '"reason": "max_games_reached_existing_replay_available"' in events
 
 
 def test_local_multiprocess_records_worker_failure(tmp_path: Path) -> None:

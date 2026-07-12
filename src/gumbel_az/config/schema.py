@@ -5,7 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 
 
 class StrictBaseModel(BaseModel):
@@ -25,6 +33,8 @@ class ExecutionConfig(StrictBaseModel):
 class ClusterConfig(StrictBaseModel):
     enabled: bool
     head_address: str | None = None
+    max_selfplay_actors_per_node: Literal["auto"] | PositiveInt = "auto"
+    head_selfplay_actors: Literal["auto"] | NonNegativeInt = "auto"
 
     @model_validator(mode="after")
     def validate_head_address(self) -> ClusterConfig:

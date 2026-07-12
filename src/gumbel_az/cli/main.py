@@ -301,6 +301,7 @@ def _ray_worker_command_hint(
 def _ray_cluster_env() -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("RAY_raylet_start_wait_time_s", "60")
+    env.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
     # Ray patch releases of Python share the same CPython ABI. Keep Ray and
     # Python major.minor strict while allowing e.g. 3.12.2 and 3.12.13 nodes.
     env.setdefault("RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL", "minor")

@@ -99,6 +99,36 @@ def test_training_compile_defaults_to_auto_and_can_be_overridden() -> None:
     assert override_config.training.compile == "off"
 
 
+def test_lan_actor_resources_default_to_auto_and_accept_manual_caps() -> None:
+    automatic = load_config(CONFIG_DIR / "connect_four_lan.yaml")
+    manual = load_config(
+        CONFIG_DIR / "connect_four_lan.yaml",
+        [
+            "cluster.max_selfplay_actors_per_node=4",
+            "cluster.head_selfplay_actors=2",
+        ],
+    )
+
+    assert automatic.cluster.max_selfplay_actors_per_node == "auto"
+    assert automatic.cluster.head_selfplay_actors == "auto"
+    assert manual.cluster.max_selfplay_actors_per_node == 4
+    assert manual.cluster.head_selfplay_actors == 2
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "cluster.max_selfplay_actors_per_node=0",
+        "cluster.max_selfplay_actors_per_node=invalid",
+        "cluster.head_selfplay_actors=-1",
+        "cluster.head_selfplay_actors=invalid",
+    ],
+)
+def test_lan_actor_resource_policy_rejects_invalid_values(override: str) -> None:
+    with pytest.raises(ValidationError):
+        load_config(CONFIG_DIR / "connect_four_lan.yaml", [override])
+
+
 def test_parse_override_requires_equals() -> None:
     with pytest.raises(ValueError, match="KEY=VALUE"):
         parse_override("run.seed")

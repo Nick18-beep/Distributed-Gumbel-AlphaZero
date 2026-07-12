@@ -9,6 +9,8 @@ execution:
 cluster:
   enabled: true
   head_address: 127.0.0.1:6379
+  max_selfplay_actors_per_node: auto
+  head_selfplay_actors: auto
 
 install:
   profile: distributed

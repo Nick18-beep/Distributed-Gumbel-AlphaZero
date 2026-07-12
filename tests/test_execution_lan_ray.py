@@ -29,6 +29,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEBUG_CONFIG = PROJECT_ROOT / "configs" / "connect_four_cpu_debug.yaml"
 
 
+def _expected_actor_options(node_id: str, *, cpus: int = 1) -> dict:
+    return {
+        "test_node_id": node_id,
+        "num_cpus": cpus,
+        "runtime_env": {
+            "env_vars": {"GAZ_RAY_ACTOR_TORCH_THREADS": str(cpus)},
+        },
+        "max_restarts": 1,
+        "max_task_retries": 1,
+    }
+
+
 class _FakeRay:
     def __init__(self) -> None:
         self.init_calls: list[dict] = []
@@ -355,6 +367,93 @@ def test_checkpoint_payload_rejects_path_escape(tmp_path: Path) -> None:
 
 def test_upload_component_removes_path_separators() -> None:
     assert lan_ray_module._safe_upload_component("../../worker\\shard") == "shard"
+
+
+def test_default_ray_actor_policy_uses_cpu_and_memory_automatically() -> None:
+    config = load_config(PROJECT_ROOT / "configs" / "connect_four_lan.yaml")
+    gib = 1024**3
+    worker_node = {"Resources": {"CPU": 16.0, "memory": 16 * gib}}
+    head_node = {"Resources": {"CPU": 12.0, "memory": 12 * gib}}
+
+    worker_plan = lan_ray_module._ray_selfplay_node_plan(
+        config,
+        worker_node,
+        is_head=False,
+        remaining_actor_budget=4096,
+    )
+    head_plan = lan_ray_module._ray_selfplay_node_plan(
+        config,
+        head_node,
+        is_head=True,
+        remaining_actor_budget=4096,
+    )
+
+    assert worker_plan.actor_count == 7
+    assert worker_plan.cpus_per_actor == 2
+    assert head_plan.actor_count == 4
+    assert head_plan.cpus_per_actor == 2
+
+
+def test_auto_ray_actor_policy_is_conservative_without_memory_resource() -> None:
+    config = load_config(PROJECT_ROOT / "configs" / "connect_four_lan.yaml")
+
+    worker_plan = lan_ray_module._ray_selfplay_node_plan(
+        config,
+        {"Resources": {"CPU": 16.0}},
+        is_head=False,
+        remaining_actor_budget=4096,
+    )
+    head_plan = lan_ray_module._ray_selfplay_node_plan(
+        config,
+        {"Resources": {"CPU": 12.0}},
+        is_head=True,
+        remaining_actor_budget=4096,
+    )
+
+    assert worker_plan.actor_count == 2
+    assert worker_plan.cpus_per_actor == 7
+    assert head_plan.actor_count == 1
+    assert head_plan.cpus_per_actor == 10
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_auto_ray_actor_policy_tolerates_invalid_ray_resources(invalid: float) -> None:
+    config = load_config(PROJECT_ROOT / "configs" / "connect_four_lan.yaml")
+
+    plan = lan_ray_module._ray_selfplay_node_plan(
+        config,
+        {"Resources": {"CPU": invalid, "memory": invalid}},
+        is_head=False,
+        remaining_actor_budget=4,
+    )
+
+    assert plan.actor_count == 1
+    assert plan.cpus_per_actor == 1
+    assert plan.memory_bytes is None
+
+
+def test_game_allocation_is_weighted_and_never_starves_an_actor() -> None:
+    assert lan_ray_module._allocate_games_by_weight(100, [7, 7, 2, 2]) == [38, 38, 12, 12]
+    assert lan_ray_module._allocate_games_by_weight(4, [100, 1, 1, 1]) == [1, 1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    ("games", "weights"),
+    [(0, []), (1, [0]), (1, [-1]), (1, [1, 1])],
+)
+def test_game_allocation_rejects_invalid_inputs(games: int, weights: list[int]) -> None:
+    with pytest.raises(ValueError, match="game allocation"):
+        lan_ray_module._allocate_games_by_weight(games, weights)
+
+
+def test_worker_config_payload_omits_head_only_actor_policy() -> None:
+    config = load_config(PROJECT_ROOT / "configs" / "connect_four_lan.yaml")
+
+    payload = lan_ray_module._worker_config_payload(config)
+
+    assert "max_selfplay_actors_per_node" not in payload["cluster"]
+    assert "head_selfplay_actors" not in payload["cluster"]
+    assert payload["cluster"]["head_address"] == "127.0.0.1:6379"
 
 
 def test_worker_default_replay_slot_is_cleaned_after_transfer(
@@ -761,18 +860,8 @@ def test_lan_ray_backend_continues_when_one_remote_worker_fails(
     assert state["remote_replay_samples_imported"] == 1
     assert replay_index["total_samples"] >= 1
     assert worker_factory.options_calls == [
-        {
-            "test_node_id": "mac-worker",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
-        {
-            "test_node_id": "win-worker",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
+        _expected_actor_options("mac-worker"),
+        _expected_actor_options("win-worker"),
     ]
 
 
@@ -854,7 +943,7 @@ def test_lan_ray_backend_uses_remote_node_cpu_slots(
                 "Alive": True,
                 "NodeID": "mac-worker",
                 "NodeManagerAddress": "192.168.1.161",
-                "Resources": {"CPU": 4.0},
+                "Resources": {"CPU": 9.0},
             },
         ]
     )
@@ -890,6 +979,7 @@ def test_lan_ray_backend_uses_remote_node_cpu_slots(
             "execution.backend=lan_ray",
             "cluster.enabled=true",
             "cluster.head_address=127.0.0.1:6399",
+            "cluster.max_selfplay_actors_per_node=4",
             "selfplay.games_per_iteration=8",
             "selfplay.batch_size=1",
             "stop.max_games=8",
@@ -917,30 +1007,10 @@ def test_lan_ray_backend_uses_remote_node_cpu_slots(
     assert state["remote_replay_samples_imported"] == 4
     assert '"event": "lan_ray_remote_selfplay_scheduled"' in events
     assert worker_factory.options_calls == [
-        {
-            "test_node_id": "mac-worker",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
-        {
-            "test_node_id": "mac-worker",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
-        {
-            "test_node_id": "mac-worker",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
-        {
-            "test_node_id": "mac-worker",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
+        _expected_actor_options("mac-worker", cpus=2),
+        _expected_actor_options("mac-worker", cpus=2),
+        _expected_actor_options("mac-worker", cpus=2),
+        _expected_actor_options("mac-worker", cpus=2),
     ]
 
 
@@ -1021,7 +1091,7 @@ def test_lan_ray_backend_schedules_three_distinct_remote_nodes(
     assert [call["test_node_id"] for call in worker_factory.options_calls] == remote_ids
 
 
-def test_lan_ray_backend_uses_head_cpu_slots_after_remote_workers(
+def test_lan_ray_backend_can_opt_in_to_head_cpu_slots_after_remote_workers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1073,6 +1143,8 @@ def test_lan_ray_backend_uses_head_cpu_slots_after_remote_workers(
             "execution.backend=lan_ray",
             "cluster.enabled=true",
             "cluster.head_address=127.0.0.1:6399",
+            "cluster.max_selfplay_actors_per_node=1",
+            "cluster.head_selfplay_actors=2",
             "selfplay.games_per_iteration=3",
             "selfplay.batch_size=1",
             "stop.max_games=3",
@@ -1096,22 +1168,7 @@ def test_lan_ray_backend_uses_head_cpu_slots_after_remote_workers(
     assert state["remote_games"] == 3
     assert state["games_seen"] == 3
     assert worker_factory.options_calls == [
-        {
-            "test_node_id": "mac-worker",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
-        {
-            "test_node_id": "head-node",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
-        {
-            "test_node_id": "head-node",
-            "num_cpus": 1,
-            "max_restarts": 1,
-            "max_task_retries": 1,
-        },
+        _expected_actor_options("mac-worker"),
+        _expected_actor_options("head-node"),
+        _expected_actor_options("head-node"),
     ]
