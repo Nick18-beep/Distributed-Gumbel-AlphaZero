@@ -283,12 +283,22 @@ def test_ray_cluster_env_enables_experimental_non_linux_multinode(
 ) -> None:
     monkeypatch.delenv("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", raising=False)
     monkeypatch.delenv("RAY_raylet_start_wait_time_s", raising=False)
+    monkeypatch.delenv("RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL", raising=False)
     monkeypatch.setattr(cli_main.sys, "platform", "darwin")
 
     env = cli_main._ray_cluster_env()
 
     assert env["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
     assert env["RAY_raylet_start_wait_time_s"] == "60"
+    assert env["RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL"] == "minor"
+
+
+def test_ray_cluster_env_preserves_explicit_strict_python_patch_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL", "patch")
+
+    assert cli_main._ray_cluster_env()["RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL"] == "patch"
 
 
 def test_ray_fixed_ports_expands_worker_range() -> None:
@@ -436,6 +446,7 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
         "--object-spilling-directory=/tmp/ray-gaz-spill",
     ]
     assert calls[0]["env"]["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
+    assert calls[0]["env"]["RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL"] == "minor"
 
 
 def test_ray_cli_prefers_current_virtual_environment(
