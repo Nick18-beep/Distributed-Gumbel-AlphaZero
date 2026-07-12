@@ -320,20 +320,21 @@ def test_ray_storage_args_are_forwarded() -> None:
     ]
 
 
-def test_ray_worker_storage_defaults_use_short_paths_on_macos(
+def test_ray_worker_storage_defaults_use_local_temp_on_every_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+    local_temp = Path("/portable/local-temp")
+    monkeypatch.setattr(cli_main.tempfile, "gettempdir", lambda: str(local_temp))
 
     assert cli_main._ray_worker_storage_defaults() == (
-        Path("/tmp/ray-gaz"),
-        Path("/tmp"),
-        Path("/tmp/ray-gaz-spill"),
+        local_temp / "ray-gaz",
+        local_temp,
+        local_temp / "ray-gaz-spill",
     )
     assert cli_main._ray_worker_storage_defaults(temp_dir=Path("/custom/ray")) == (
         Path("/custom/ray"),
-        Path("/tmp"),
-        Path("/tmp/ray-gaz-spill"),
+        local_temp,
+        local_temp / "ray-gaz-spill",
     )
 
 
@@ -403,6 +404,7 @@ def test_cluster_worker_passes_non_linux_ray_multinode_env(
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+    monkeypatch.setattr(cli_main.tempfile, "gettempdir", lambda: "/tmp")
     monkeypatch.setattr(cli_main, "_detect_lan_ip", lambda: "192.168.1.161")
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
@@ -470,6 +472,7 @@ def test_cluster_worker_passes_fixed_ray_ports(
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    monkeypatch.setattr(cli_main.tempfile, "gettempdir", lambda: "/worker/tmp")
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
     monkeypatch.setattr(cli_main, "_ensure_local_ray_ports_available", lambda ports: None)
@@ -519,6 +522,9 @@ def test_cluster_worker_passes_fixed_ray_ports(
         "--metrics-export-port=6386",
         "--min-worker-port=10002",
         "--max-worker-port=10101",
+        "--temp-dir=/worker/tmp/ray-gaz",
+        "--plasma-directory=/worker/tmp",
+        "--object-spilling-directory=/worker/tmp/ray-gaz-spill",
     ]
 
 
@@ -543,6 +549,7 @@ def test_cluster_worker_keep_alive_polls_after_start(
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    monkeypatch.setattr(cli_main.tempfile, "gettempdir", lambda: "/worker/tmp")
     monkeypatch.setattr(cli_main, "_ray_cli_path", lambda: "ray")
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
     monkeypatch.setattr(cli_main, "_keep_ray_worker_alive", fake_keep_alive)
@@ -572,6 +579,9 @@ def test_cluster_worker_keep_alive_polls_after_start(
         "--address=192.168.1.12:6379",
         "--node-ip-address=192.168.1.161",
         "--disable-usage-stats",
+        "--temp-dir=/worker/tmp/ray-gaz",
+        "--plasma-directory=/worker/tmp",
+        "--object-spilling-directory=/worker/tmp/ray-gaz-spill",
     ]
     assert keep_alive_calls == [
         {

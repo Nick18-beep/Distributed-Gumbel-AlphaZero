@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Annotated, Any, Literal, cast
@@ -206,12 +207,11 @@ def _ray_worker_storage_defaults(
     plasma_directory: Path | None = None,
     object_spilling_directory: Path | None = None,
 ) -> tuple[Path | None, Path | None, Path | None]:
-    if sys.platform != "darwin":
-        return temp_dir, plasma_directory, object_spilling_directory
+    local_temp = Path(tempfile.gettempdir())
     return (
-        temp_dir or Path("/tmp/ray-gaz"),
-        plasma_directory or Path("/tmp"),
-        object_spilling_directory or Path("/tmp/ray-gaz-spill"),
+        temp_dir or local_temp / "ray-gaz",
+        plasma_directory or local_temp,
+        object_spilling_directory or local_temp / "ray-gaz-spill",
     )
 
 
